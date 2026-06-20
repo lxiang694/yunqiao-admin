@@ -1,0 +1,3516 @@
+<!DOCTYPE html>
+<html lang="zh-Hant"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" /><title>雲橋集運 後台</title>
+<style>html,body{margin:0;padding:0;background:#F4F2EC}#root{min-height:100vh}</style>
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+<script src="https://cdn.jsdelivr.net/npm/@zxing/browser@0.1.5/umd/index.min.js" async></script>
+<script src="https://fastly.jsdelivr.net/npm/@zxing/browser@0.1.5/umd/index.min.js" async></script>
+<script src="https://npm.elemecdn.com/@zxing/browser@0.1.5/umd/index.min.js" async></script>
+<script src="https://unpkg.com/@zxing/browser@0.1.5/umd/index.min.js" async></script>
+<script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js"></script>
+</head><body><div id="root">載入中…</div>
+<script type="text/babel" data-presets="react">
+const {useState, useEffect, useRef, useCallback} = React;
+
+/* ============================================================
+   雲橋集運 · 管理端 (Admin)
+   登入 + 管理員帳號管理 + 倉庫作業（掃碼到倉/秤重拍照上架/同用戶集中貨架/異常包裹/貨架）
+   已連接線上 Supabase
+   ============================================================ */
+const SUPA_URL = "https://allztrbovuomqbemmuxd.supabase.co";
+const ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFsbHp0cmJvdnVvbXFiZW1tdXhkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODE2NzE2MDUsImV4cCI6MjA5NzI0NzYwNX0.5Dmk8ht4H5cY57YKfgsNLtnlNFvrrfY198ADEbS0Otk";
+const ROLE_LABEL = { super: "超級管理員", finance: "財務", warehouse: "倉庫打包", custom: "自訂" };
+const PKG_LABEL = { pending: "待到倉", arrived: "已到倉", abnormal: "異常", packed: "已打包", shipped: "已出貨" };
+
+async function login(email, password) {
+  const r = await fetch(`${SUPA_URL}/auth/v1/token?grant_type=password`, { method: "POST", headers: { apikey: ANON, "Content-Type": "application/json" }, body: JSON.stringify({ email, password }) });
+  const d = await r.json(); if (!r.ok) throw new Error(d.error_description || d.msg || d.error || "登入失敗"); return d;
+}
+async function rest(path, { method = "GET", token, body, prefer } = {}) {
+  const h = { apikey: ANON, Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
+  if (prefer) h.Prefer = prefer;
+  const r = await fetch(`${SUPA_URL}/rest/v1/${path}`, { method, headers: h, body: body ? JSON.stringify(body) : undefined });
+  const t = await r.text(); const d = t ? JSON.parse(t) : null;
+  if (!r.ok) throw new Error((d && (d.message || d.hint)) || "資料庫錯誤"); return d;
+}
+async function fn(action, payload, token) {
+  const r = await fetch(`${SUPA_URL}/functions/v1/admin-manage`, { method: "POST", headers: { apikey: ANON, Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ action, ...payload }) });
+  const d = await r.json(); if (!r.ok) throw new Error(d.error || "操作失敗"); return d;
+}
+async function ops(action, payload, token) {
+  const r = await fetch(`${SUPA_URL}/functions/v1/ops-actions`, { method: "POST", headers: { apikey: ANON, Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ action, ...payload }) });
+  const d = await r.json(); if (!r.ok) throw new Error(d.error || "操作失敗"); return d;
+}
+// 在本機把圖片縮小到長邊 maxSide 並壓成 JPEG，大幅減少傳輸與後端寫入時間
+async function compressImage(file, maxSide = 1600, quality = 0.82) {
+  if (!file || !file.type?.startsWith("image/")) return file;
+  try {
+    const bitmap = await (window.createImageBitmap ? createImageBitmap(file) : new Promise((res, rej) => {
+      const img = new Image(); img.onload = () => res(img); img.onerror = rej; img.src = URL.createObjectURL(file);
+    }));
+    const w0 = bitmap.width || bitmap.naturalWidth;
+    const h0 = bitmap.height || bitmap.naturalHeight;
+    const scale = Math.min(1, maxSide / Math.max(w0, h0));
+    const w = Math.round(w0 * scale), h = Math.round(h0 * scale);
+    const canvas = document.createElement("canvas");
+    canvas.width = w; canvas.height = h;
+    canvas.getContext("2d").drawImage(bitmap, 0, 0, w, h);
+    const blob = await new Promise((res) => canvas.toBlob(res, "image/jpeg", quality));
+    if (!blob || blob.size >= file.size) return file;
+    return new File([blob], (file.name || "img").replace(/\.[^.]+$/, "") + ".jpg", { type: "image/jpeg" });
+  } catch (e) { return file; }
+}
+async function uploadTo(bucket, file, token) {
+  const f = await compressImage(file);
+  const ext = "jpg";
+  const b64 = await new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(String(r.result).split(",")[1]);
+    r.onerror = () => rej(new Error("讀取檔案失敗"));
+    r.readAsDataURL(f);
+  });
+  const r = await fetch(`${SUPA_URL}/functions/v1/upload-asset`, {
+    method: "POST",
+    headers: { apikey: ANON, Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ bucket, ext, base64: b64, contentType: "image/jpeg" }),
+  });
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.error || "上傳失敗");
+  return d;
+}
+async function uploadPkgPhoto(file, token) {
+  const r = await uploadTo("package-photos", file, token);
+  return r.publicUrl;
+}
+
+// ZXing：iOS Safari/Chrome 沒有原生 BarcodeDetector，必須靠 ZXing 解碼。
+// 多 CDN 並行嘗試（哪個先到用哪個），含中國／亞太友善鏡像；總超時 10 秒。
+let __zxingPromise = null;
+function ensureZXing(timeoutMs = 10000) {
+  if (typeof window === "undefined") return Promise.resolve(false);
+  if (window.ZXingBrowser) return Promise.resolve(true);
+  if (__zxingPromise) return __zxingPromise;
+  const urls = [
+    "https://cdn.jsdelivr.net/npm/@zxing/browser@0.1.5/umd/index.min.js",
+    "https://fastly.jsdelivr.net/npm/@zxing/browser@0.1.5/umd/index.min.js",
+    "https://gcore.jsdelivr.net/npm/@zxing/browser@0.1.5/umd/index.min.js",
+    "https://testingcf.jsdelivr.net/npm/@zxing/browser@0.1.5/umd/index.min.js",
+    "https://unpkg.com/@zxing/browser@0.1.5/umd/index.min.js",
+    "https://npm.elemecdn.com/@zxing/browser@0.1.5/umd/index.min.js",
+    "https://cdn.staticfile.org/zxing-browser/0.1.5/index.min.js",
+    "https://lib.baomitu.com/zxing-js/0.18.6/index.min.js",
+    "https://cdn.bootcdn.net/ajax/libs/zxing-js/0.18.6/index.min.js",
+  ];
+  __zxingPromise = new Promise((res) => {
+    let done = false;
+    const finish = (ok) => { if (done) return; done = true; res(ok); if (!ok) __zxingPromise = null; };
+    // 並行載入所有 CDN，第一個成功的就接管
+    urls.forEach((url) => {
+      const s = document.createElement("script");
+      s.src = url; s.async = true; s.crossOrigin = "anonymous";
+      s.onload = () => { if (window.ZXingBrowser) finish(true); };
+      s.onerror = () => {};
+      document.head.appendChild(s);
+    });
+    // 總超時
+    setTimeout(() => finish(!!window.ZXingBrowser), timeoutMs);
+  });
+  return __zxingPromise;
+}
+if (typeof window !== "undefined") setTimeout(() => ensureZXing(), 100);
+
+// Session 持久化（localStorage）
+const SESS_KEY = "yq_admin_session";
+function loadAdminSess() { try { const s = localStorage.getItem(SESS_KEY); return s ? JSON.parse(s) : null; } catch (e) { return null; } }
+function saveAdminSess(s) { try { localStorage.setItem(SESS_KEY, JSON.stringify(s)); } catch (e) {} }
+function clearAdminSess() { try { localStorage.removeItem(SESS_KEY); } catch (e) {} }
+async function refreshAdminToken(refresh_token) {
+  const r = await fetch(`${SUPA_URL}/auth/v1/token?grant_type=refresh_token`, { method: "POST", headers: { apikey: ANON, "Content-Type": "application/json" }, body: JSON.stringify({ refresh_token }) });
+  const d = await r.json(); if (!r.ok) throw new Error(d.error_description || d.msg || "session expired"); return d;
+}
+
+const SP_SESS_KEY = "yq_sp_session";
+function loadSpSess() { try { const s = localStorage.getItem(SP_SESS_KEY); return s ? JSON.parse(s) : null; } catch (e) { return null; } }
+function saveSpSess(s) { try { localStorage.setItem(SP_SESS_KEY, JSON.stringify(s)); } catch (e) {} }
+function clearSpSess() { try { localStorage.removeItem(SP_SESS_KEY); } catch (e) {} }
+
+function App() {
+  const [session, setSession] = useState(null);
+  const [spSession, setSpSession] = useState(null);  // 業務員 session
+  const [booting, setBooting] = useState(true);
+  const [toast, setToast] = useState("");
+  const flash = (m) => { setToast(m); setTimeout(() => setToast(""), 2600); };
+  useEffect(() => {
+    const l = document.createElement("link"); l.rel = "stylesheet";
+    l.href = "https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=Space+Mono:wght@400;700&display=swap";
+    document.head.appendChild(l);
+    (async () => {
+      // 先檢查業務員 session
+      const sp = loadSpSess();
+      if (sp?.sp_token && sp?.sp_id) {
+        try {
+          const r = await fetch(`${SUPA_URL}/functions/v1/salesperson-api`, {
+            method: "POST",
+            headers: { apikey: ANON, "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "me", sp_token: sp.sp_token, sp_id: sp.sp_id }),
+          });
+          const d = await r.json();
+          if (r.ok && d.ok) {
+            setSpSession({ sp_token: sp.sp_token, sp_id: sp.sp_id, salesperson: d.salesperson });
+            setBooting(false); return;
+          } else clearSpSess();
+        } catch (e) { clearSpSess(); }
+      }
+      // 管理員 session
+      const saved = loadAdminSess();
+      if (!saved?.token) { setBooting(false); return; }
+      try {
+        const rows = await rest(`admins?auth_user_id=eq.${saved.me?.auth_user_id}&select=*`, { token: saved.token });
+        const me = rows && rows[0];
+        if (me && me.is_active) {
+          setSession({ token: saved.token, refresh_token: saved.refresh_token, me });
+        } else throw new Error("invalid");
+      } catch (e) {
+        if (saved.refresh_token) {
+          try {
+            const d = await refreshAdminToken(saved.refresh_token);
+            const rows = await rest(`admins?auth_user_id=eq.${d.user.id}&select=*`, { token: d.access_token });
+            const me = rows && rows[0];
+            if (me && me.is_active) {
+              const s = { token: d.access_token, refresh_token: d.refresh_token, me };
+              saveAdminSess(s); setSession(s);
+            } else clearAdminSess();
+          } catch (e2) { clearAdminSess(); }
+        } else clearAdminSess();
+      }
+      setBooting(false);
+    })();
+  }, []);
+  const handleLogin = (s) => { saveAdminSess(s); setSession(s); };
+  const handleLogout = () => { clearAdminSess(); setSession(null); };
+  const handleSpLogin = (s) => { saveSpSess(s); setSpSession(s); };
+  const handleSpLogout = () => { clearSpSess(); setSpSession(null); };
+  if (booting) return (<div className="admin-wrap"><style>{CSS}</style><div className="login"><div className="login-card" style={{textAlign:"center"}}>載入中…</div></div></div>);
+  return (
+    <div className="admin-wrap">
+      <style>{CSS}</style>
+      {spSession ? <SpDashboard spSession={spSession} setSpSession={setSpSession} onLogout={handleSpLogout} flash={flash} />
+        : session ? <Dashboard session={session} onLogout={handleLogout} flash={flash} />
+        : <Login onLogin={handleLogin} onSpLogin={handleSpLogin} />}
+      {toast && <div className="toast">{toast}</div>}
+    </div>
+  );
+}
+
+function Login({ onLogin, onSpLogin }) {
+  const [mode, setMode] = useState("admin"); // admin | sp
+  const [email, setEmail] = useState("");
+  const [pw, setPw] = useState("");
+  const [spUser, setSpUser] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const submit = async () => {
+    setErr(""); setBusy(true);
+    try {
+      if (mode === "admin") {
+        const auth = await login(email.trim(), pw);
+        const rows = await rest(`admins?auth_user_id=eq.${auth.user.id}&select=*`, { token: auth.access_token });
+        const me = rows && rows[0];
+        if (!me) throw new Error("此帳號不是管理員");
+        if (!me.is_active) throw new Error("此管理員帳號已停用");
+        onLogin({ token: auth.access_token, refresh_token: auth.refresh_token, me });
+      } else {
+        if (!spUser.trim() || !pw) throw new Error("請輸入業務員帳號與密碼");
+        const r = await fetch(`${SUPA_URL}/functions/v1/salesperson-api`, {
+          method: "POST",
+          headers: { apikey: ANON, "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "login", username: spUser.trim(), password: pw }),
+        });
+        const d = await r.json();
+        if (!r.ok || !d.ok) throw new Error(d.error || "登入失敗");
+        onSpLogin({ sp_token: d.token, sp_id: d.salesperson.id, salesperson: d.salesperson });
+      }
+    } catch (e) { setErr(e.message); }
+    setBusy(false);
+  };
+
+  return (
+    <div className="login"><div className="login-card">
+      <div className="brand-row"><div className="brand-mark">雲</div><div><div className="brand-t">雲橋集運</div><div className="brand-s">{mode === "admin" ? "管理後台" : "業務員後台"}</div></div></div>
+      <div className="login-tabs">
+        <button className={mode === "admin" ? "on" : ""} onClick={() => { setMode("admin"); setErr(""); }}>管理員登入</button>
+        <button className={mode === "sp" ? "on" : ""} onClick={() => { setMode("sp"); setErr(""); }}>業務員登入</button>
+      </div>
+      {mode === "admin" ? (
+        <>
+          <label className="fld"><span>管理員 Email</span><input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="admin@example.com" onKeyDown={(e) => e.key === "Enter" && submit()} /></label>
+          <label className="fld"><span>密碼</span><input type="password" value={pw} onChange={(e) => setPw(e.target.value)} placeholder="輸入密碼" onKeyDown={(e) => e.key === "Enter" && submit()} /></label>
+        </>
+      ) : (
+        <>
+          <label className="fld"><span>業務員帳號</span><input value={spUser} onChange={(e) => setSpUser(e.target.value)} placeholder="業務員登入帳號" onKeyDown={(e) => e.key === "Enter" && submit()} autoComplete="username" /></label>
+          <label className="fld"><span>密碼</span><input type="password" value={pw} onChange={(e) => setPw(e.target.value)} placeholder="輸入密碼" onKeyDown={(e) => e.key === "Enter" && submit()} /></label>
+          <div className="login-hint">業務員帳號由總後台建立，如未取得請聯繫管理員。</div>
+        </>
+      )}
+      {err && <div className="err">{err}</div>}
+      <button className="btn primary block" disabled={busy} onClick={submit}>{busy ? "登入中…" : "登入"}</button>
+    </div></div>
+  );
+}
+
+function Dashboard({ session, onLogout, flash }) {
+  const { me } = session;
+  const has = (p) => me.is_super || (me.permissions || []).includes(p);
+  const canAdmins = has("admin.manage");
+  const canCust = has("customers.view");
+  const canWh = has("warehouse.scan") || has("warehouse.weigh") || has("warehouse.abnormal") || has("warehouse.shelf");
+  const canPack = has("warehouse.pack");
+  const canFin = has("finance.verify") || has("finance.orders");
+  const canFinOrd = has("finance.orders");
+  const canSet = has("settings.rates") || has("settings.points") || has("settings.coupons") || has("finance.qr");
+  const canSp = has("salespersons.manage") || has("salespersons.view");
+  const NAV = [
+    { key: "home",         label: "總覽",     icon: "▦",  on: true },
+    { key: "stats",        label: "統計報表", icon: "📊", on: canFinOrd || me.is_super },
+    { key: "warehouse",    label: "倉庫作業", icon: "📦", on: canWh },
+    { key: "pack",         label: "打包出貨", icon: "🚚", on: canPack },
+    { key: "finance",      label: "財務",     icon: "💳", on: canFin },
+    { key: "members",      label: "會員管理", icon: "👥", on: canCust },
+    { key: "salespersons", label: "業務員管理", icon: "🎯", on: canSp },
+    { key: "settings",     label: "營運設定", icon: "⚙",  on: canSet },
+    { key: "admins",       label: "管理員帳號", icon: "👤", on: canAdmins },
+  ];
+  const first = NAV.find((n) => n.on && n.key !== "home")?.key || "home";
+  const [tab, setTab] = useState(first);
+  const [navOpts, setNavOpts] = useState({});
+  const goto = (key, opts = {}) => {
+    const item = NAV.find((n) => n.key === key);
+    if (!item || !item.on) return;
+    setNavOpts(opts);
+    setTab(key);
+  };
+  const setTabClean = (k) => { setNavOpts({}); setTab(k); };
+  return (
+    <div className="dash">
+      <header className="topbar">
+        <div className="brand-row sm"><div className="brand-mark sm">雲</div><b>雲橋集運 後台</b></div>
+        <div className="who"><span className={"role-badge r-" + me.role}>{ROLE_LABEL[me.role] || me.role}</span><span className="who-name">{me.display_name || me.email}</span><button className="btn ghost tiny" onClick={onLogout}>登出</button></div>
+      </header>
+      <div className="body">
+        <nav className="side">
+          {NAV.map((n) => <button key={n.key} disabled={!n.on} className={"nav " + (tab === n.key ? "on" : "") + (n.on ? "" : " soon")} onClick={() => n.on && setTabClean(n.key)}><span className="nav-i">{n.icon}</span>{n.label}{!n.on && <i className="soon-tag">無權限</i>}</button>)}
+        </nav>
+        <main className="main">
+          {tab === "home" && <Overview me={me} session={session} goto={goto} has={has} />}
+          {tab === "stats" && <StatsPage session={session} />}
+          {tab === "warehouse" && canWh && <Warehouse session={session} has={has} flash={flash} initialSub={navOpts.sub} />}
+          {tab === "pack" && canPack && <PackOps session={session} flash={flash} />}
+          {tab === "finance" && canFin && <FinancePage session={session} has={has} flash={flash} initialSub={navOpts.sub} initialFilter={navOpts.filter} />}
+          {tab === "settings" && canSet && <SettingsPage session={session} has={has} flash={flash} />}
+          {tab === "members" && canCust && <MembersPage session={session} flash={flash} initialSort={navOpts.sort} />}
+          {tab === "salespersons" && canSp && <SalespersonsPage session={session} has={has} flash={flash} />}
+          {tab === "admins" && canAdmins && <AdminsPage session={session} flash={flash} />}
+        </main>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// 共用工具：時間篩選 / 折線圖 / CSV 匯出 / 統計計算
+// ============================================================
+
+// 日期工具
+function fmtDate(d) { return d instanceof Date ? d.toISOString().slice(0, 10) : String(d).slice(0, 10); }
+function addDays(d, n) { const r = new Date(d); r.setDate(r.getDate() + n); return r; }
+function today() { return fmtDate(new Date()); }
+function monthStart(offset = 0) {
+  const d = new Date(); d.setMonth(d.getMonth() + offset); d.setDate(1);
+  return fmtDate(d);
+}
+function monthEnd(offset = 0) {
+  const d = new Date(); d.setMonth(d.getMonth() + offset + 1); d.setDate(0);
+  return fmtDate(d);
+}
+function weekStart() { const d = new Date(); d.setDate(d.getDate() - ((d.getDay() + 6) % 7)); return fmtDate(d); }
+
+// 時間篩選器元件
+function DateRangePicker({ value, onChange }) {
+  const presets = [
+    { label: "今日",   start: today(),      end: today() },
+    { label: "本週",   start: weekStart(),  end: today() },
+    { label: "本月",   start: monthStart(), end: today() },
+    { label: "上月",   start: monthStart(-1), end: monthEnd(-1) },
+    { label: "近三月", start: fmtDate(addDays(new Date(), -90)), end: today() },
+  ];
+  const [custom, setCustom] = React.useState(false);
+  const isPreset = (p) => value.start === p.start && value.end === p.end;
+  return (
+    <div className="drp">
+      <div className="drp-presets">
+        {presets.map(p => (
+          <button key={p.label} className={"drp-btn" + (isPreset(p) ? " on" : "")}
+            onClick={() => { onChange(p); setCustom(false); }}>
+            {p.label}
+          </button>
+        ))}
+        <button className={"drp-btn" + (custom ? " on" : "")} onClick={() => setCustom(v => !v)}>
+          自訂 ▾
+        </button>
+      </div>
+      {custom && (
+        <div className="drp-custom">
+          <input type="date" value={value.start} max={value.end}
+            onChange={e => onChange({ ...value, start: e.target.value })} />
+          <span>至</span>
+          <input type="date" value={value.end} min={value.start} max={today()}
+            onChange={e => onChange({ ...value, end: e.target.value })} />
+        </div>
+      )}
+      <span className="drp-range">{value.start} ～ {value.end}</span>
+    </div>
+  );
+}
+
+// SVG 折線圖
+function LineChart({ data, keyX, keyY, label, color = "#1B3A6B", height = 160 }) {
+  if (!data || data.length === 0) return <div className="chart-empty">暫無數據</div>;
+  const vals = data.map(d => Number(d[keyY] || 0));
+  const max = Math.max(...vals, 1);
+  const min = 0;
+  const W = 520; const H = height; const PL = 44; const PR = 12; const PT = 12; const PB = 28;
+  const cw = W - PL - PR; const ch = H - PT - PB;
+  const pts = data.map((d, i) => {
+    const x = PL + (i / Math.max(data.length - 1, 1)) * cw;
+    const y = PT + ch - ((Number(d[keyY] || 0) - min) / (max - min)) * ch;
+    return [x, y];
+  });
+  const polyline = pts.map(([x, y]) => `${x},${y}`).join(" ");
+  const area = `M ${pts[0][0]},${PT + ch} ` + pts.map(([x, y]) => `L ${x},${y}`).join(" ") + ` L ${pts[pts.length - 1][0]},${PT + ch} Z`;
+  // Y 軸刻度
+  const yticks = [0, 0.25, 0.5, 0.75, 1].map(r => ({ r, v: Math.round(min + (max - min) * r) }));
+  // X 軸標籤（最多顯示 7 個）
+  const step = Math.max(1, Math.floor(data.length / 7));
+  const xlabels = data.filter((_, i) => i % step === 0 || i === data.length - 1);
+  return (
+    <div className="chart-wrap">
+      <div className="chart-label">{label}</div>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: H }}>
+        {/* 網格 */}
+        {yticks.map(({ r, v }) => {
+          const y = PT + ch - r * ch;
+          return (
+            <g key={r}>
+              <line x1={PL} y1={y} x2={W - PR} y2={y} stroke="#EAECF0" strokeWidth="1" />
+              <text x={PL - 6} y={y + 4} textAnchor="end" fontSize="10" fill="#9AA5B4">{v}</text>
+            </g>
+          );
+        })}
+        {/* 面積 */}
+        <path d={area} fill={color} opacity="0.1" />
+        {/* 折線 */}
+        <polyline points={polyline} fill="none" stroke={color} strokeWidth="2.5" strokeLinejoin="round" />
+        {/* 點 */}
+        {pts.map(([x, y], i) => (
+          <circle key={i} cx={x} cy={y} r="3.5" fill={color} stroke="#fff" strokeWidth="1.5" />
+        ))}
+        {/* X 軸標籤 */}
+        {xlabels.map((d, i) => {
+          const origIdx = data.indexOf(d);
+          const x = PL + (origIdx / Math.max(data.length - 1, 1)) * cw;
+          return <text key={i} x={x} y={H - 4} textAnchor="middle" fontSize="9.5" fill="#9AA5B4">{String(d[keyX]).slice(5)}</text>;
+        })}
+      </svg>
+    </div>
+  );
+}
+
+// CSV 匯出工具
+function exportCsv(rows, headers, filename) {
+  const bom = "\uFEFF"; // Excel 繁體中文 BOM
+  const lines = [headers.map(h => h.label).join(",")];
+  rows.forEach(r => lines.push(headers.map(h => {
+    const v = String(r[h.key] ?? "").replace(/"/g, '""');
+    return v.includes(",") || v.includes("\n") ? `"${v}"` : v;
+  }).join(",")));
+  const blob = new Blob([bom + lines.join("\n")], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a"); a.href = url; a.download = filename; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// 環比計算
+function pct(now, prev) {
+  if (!prev || prev === 0) return null;
+  const p = ((now - prev) / prev * 100);
+  return { val: Math.abs(p).toFixed(1), up: p >= 0 };
+}
+
+// 環比標籤元件
+function TrendBadge({ now, prev }) {
+  const t = pct(Number(now || 0), Number(prev || 0));
+  if (!t) return <span className="trend-na">—</span>;
+  return <span className={"trend-badge " + (t.up ? "up" : "down")}>{t.up ? "▲" : "▼"} {t.val}%</span>;
+}
+
+// 統計 KPI 卡
+function KpiCard({ label, value, sub, trend, trendLabel, highlight }) {
+  return (
+    <div className={"kpi-card" + (highlight ? " highlight" : "")}>
+      <div className="kpi-label">{label}</div>
+      <div className="kpi-value">{value ?? "—"}</div>
+      {sub && <div className="kpi-sub">{sub}</div>}
+      {trend !== undefined && trendLabel && (
+        <div className="kpi-trend"><span className="kpi-prev">{trendLabel}</span><TrendBadge now={value?.toString().replace(/[^0-9.]/g,"")} prev={trend?.toString().replace(/[^0-9.]/g,"")} /></div>
+      )}
+    </div>
+  );
+}
+
+function Overview({ me, session, goto, has }) {
+  const [st, setSt] = useState(null);
+  const [ext, setExt] = useState(null);  // 擴充數據（本月 vs 上月）
+  const [err, setErr] = useState("");
+  const [rankBy, setRankBy] = useState("rmb"); // rmb | orders | customers
+
+  const load = async () => {
+    try {
+      const [r1, r2] = await Promise.all([
+        fetch(`${SUPA_URL}/rest/v1/rpc/admin_overview`, { method: "POST", headers: { apikey: ANON, Authorization: `Bearer ${session.token}`, "Content-Type": "application/json" }, body: "{}" }),
+        fetch(`${SUPA_URL}/rest/v1/rpc/admin_overview_extended`, { method: "POST", headers: { apikey: ANON, Authorization: `Bearer ${session.token}`, "Content-Type": "application/json" }, body: "{}" }),
+      ]);
+      const d1 = await r1.json(); if (!r1.ok) throw new Error(d1.message || "讀取失敗");
+      setSt(d1);
+      if (r2.ok) { const d2 = await r2.json(); setExt(d2); }
+    } catch (e) { setErr(e.message); }
+  };
+  useEffect(() => { load(); const t = setInterval(load, 30000); return () => clearInterval(t); }, []);
+
+  const canCust = has("customers.view");
+  const canAbn = has("warehouse.abnormal");
+  const canWhSee = has("warehouse.scan") || has("warehouse.weigh");
+  const canFinRev = has("finance.verify");
+  const canPack = has("warehouse.pack");
+  const canFinOrd = has("finance.orders");
+
+  const cards = !st ? [] : [
+    { color: "",     label: "今日新註冊", value: st.users_today,            hint: `累計 ${st.users_total} 位用戶`,
+      enable: canCust,   goto: () => goto("members", { sort: "today" }),       hover: "查看會員 →" },
+    { color: "warn", label: "異常包裹",   value: st.pkg_abnormal,           hint: "需處理",
+      enable: canAbn,    goto: () => goto("warehouse", { sub: "abnormal" }),  hover: "處理異常 →" },
+    { color: "",     label: "待到倉",     value: st.pkg_pending,            hint: "用戶已錄入",
+      enable: canWhSee,  goto: () => goto("warehouse", { sub: "intake" }),    hover: "去掃碼到倉 →" },
+    { color: "sea",  label: "已到倉",     value: st.pkg_arrived,            hint: "等待集運",
+      enable: canWhSee,  goto: () => goto("warehouse", { sub: "intake" }),    hover: "倉庫作業 →" },
+    { color: "warn", label: "待確認付款", value: st.orders_review,          hint: "財務待核對",
+      enable: canFinRev, goto: () => goto("finance", { sub: "review" }),     hover: "去確認 →" },
+    { color: "sea",  label: "打包中",     value: st.orders_packing,         hint: "等待出貨",
+      enable: canPack,   goto: () => goto("pack"),                            hover: "去打包 →" },
+    { color: "leaf", label: "今日已出貨", value: st.orders_shipped_today,   hint: "新竹／黑貓／7-11",
+      enable: canFinOrd, goto: () => goto("finance", { sub: "orders", filter: "shipped" }), hover: "查看訂單 →" },
+    { color: "",     label: "今日訂單",   value: st.orders_today,           hint: "含未付款",
+      enable: canFinOrd, goto: () => goto("finance", { sub: "orders", filter: "all" }),     hover: "查看訂單 →" },
+  ];
+
+  // 排名排序
+  const spRank = ext?.sp_rank ? [...ext.sp_rank].sort((a, b) => {
+    if (rankBy === "orders")    return (b.orders || 0) - (a.orders || 0);
+    if (rankBy === "customers") return (b.customers || 0) - (a.customers || 0);
+    return ((b.rmb_amt || 0) + (b.twd_amt || 0) / 4.8) - ((a.rmb_amt || 0) + (a.twd_amt || 0) / 4.8);
+  }) : [];
+  const medals = ["🥇", "🥈", "🥉"];
+
+  return (
+    <div>
+      <h2 className="page-t">總覽</h2>
+      <div className="welcome">歡迎回來，{me.display_name || me.email}。每 30 秒自動更新。點擊任一卡片可直接進入對應功能頁。</div>
+      {err && <div className="err">{err}</div>}
+
+      {/* 即時狀態卡 */}
+      {!st ? <div className="muted">載入中…</div> : (
+        <div className="ov-grid">
+          {cards.map((c, i) => (
+            <button key={i} type="button" disabled={!c.enable}
+              className={"ov-card clickable " + c.color + (c.enable ? "" : " noclick")}
+              onClick={c.enable ? c.goto : undefined}>
+              <span>{c.label}</span>
+              <b>{c.value}</b>
+              <i>{c.hint}</i>
+              {c.enable && <em className="ov-go">{c.hover}</em>}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* ── 本月 vs 上月對比 ── */}
+      {ext && (
+        <>
+          <div className="ov-section-title">
+            <span>📊 本月 vs 上月 對比分析</span>
+            <span className="ov-section-hint">統計基準：付款確認時間</span>
+          </div>
+          <div className="kpi-grid">
+            <KpiCard label="本月新用戶"   value={ext.this_users}           trend={ext.last_users}           trendLabel={`上月 ${ext.last_users}`} highlight />
+            <KpiCard label="本月訂單數"   value={ext.this_month?.orders}   trend={ext.last_month?.orders}   trendLabel={`上月 ${ext.last_month?.orders}`} />
+            <KpiCard label="本月業務員訂單" value={ext.this_month?.sp_orders} trend={ext.last_month?.sp_orders} trendLabel={`上月 ${ext.last_month?.sp_orders}`} />
+            <KpiCard label="本月自然流量訂單" value={ext.this_month?.organic_orders} trend={ext.last_month?.organic_orders} trendLabel={`上月 ${ext.last_month?.organic_orders}`} />
+            <KpiCard label="本月 RMB 收入" value={`¥${Math.round(ext.this_month?.rmb || 0)}`} trend={Math.round(ext.last_month?.rmb || 0)} trendLabel={`上月 ¥${Math.round(ext.last_month?.rmb || 0)}`} highlight />
+            <KpiCard label="本月 TWD 收入" value={`NT$${Math.round(ext.this_month?.twd || 0)}`} trend={Math.round(ext.last_month?.twd || 0)} trendLabel={`上月 NT$${Math.round(ext.last_month?.twd || 0)}`} highlight />
+            <KpiCard label="本月總重量"   value={`${Math.round(ext.this_month?.weight || 0)}kg`} trend={Math.round(ext.last_month?.weight || 0)} trendLabel={`上月 ${Math.round(ext.last_month?.weight || 0)}kg`} />
+            <KpiCard label="本月活躍用戶" value={ext.this_month?.active_users} trend={ext.last_month?.active_users} trendLabel={`上月 ${ext.last_month?.active_users}`} />
+          </div>
+
+          {/* ── 業務員業績排名 ── */}
+          <div className="ov-section-title">
+            <span>🏆 業務員業績排名（本月）</span>
+            <div className="rank-tabs">
+              <button className={"rank-tab" + (rankBy === "rmb" ? " on" : "")} onClick={() => setRankBy("rmb")}>按金額</button>
+              <button className={"rank-tab" + (rankBy === "orders" ? " on" : "")} onClick={() => setRankBy("orders")}>按訂單</button>
+              <button className={"rank-tab" + (rankBy === "customers" ? " on" : "")} onClick={() => setRankBy("customers")}>按客戶</button>
+            </div>
+          </div>
+          <div className="card">
+            {spRank.length === 0 ? <div className="muted">本月暫無業務員訂單</div> : (
+              <table className="tbl">
+                <thead>
+                  <tr><th style={{width:36}}>名次</th><th>業務員</th><th>本月訂單</th><th>本月客戶</th><th>RMB 收入</th><th>TWD 收入</th><th>重量</th><th>佔比</th></tr>
+                </thead>
+                <tbody>
+                  {/* 自然流量行 */}
+                  {ext.organic && (
+                    <tr className="organic-row">
+                      <td style={{textAlign:"center"}}>—</td>
+                      <td><span className="sp-name-tag organic">自然流量</span></td>
+                      <td><b>{ext.organic.orders}</b></td>
+                      <td>{ext.organic.customers}</td>
+                      <td>¥{Math.round(ext.organic.rmb_amt || 0)}</td>
+                      <td>NT${Math.round(ext.organic.twd_amt || 0)}</td>
+                      <td>—</td>
+                      <td className="sm">—</td>
+                    </tr>
+                  )}
+                  {spRank.map((sp, i) => {
+                    const totalOrders = (ext.this_month?.orders || 0);
+                    const pctVal = totalOrders ? Math.round((sp.orders || 0) / totalOrders * 100) : 0;
+                    return (
+                      <tr key={sp.id}>
+                        <td style={{textAlign:"center",fontSize:18}}>{medals[i] || (i + 1)}</td>
+                        <td><b>{sp.name}</b><div className="sm muted mono">{sp.promo_code}</div></td>
+                        <td><b>{sp.orders || 0}</b></td>
+                        <td>{sp.customers || 0}</td>
+                        <td>¥{Math.round(sp.rmb_amt || 0)}</td>
+                        <td>NT${Math.round(sp.twd_amt || 0)}</td>
+                        <td>{Math.round(sp.weight || 0)}kg</td>
+                        <td>
+                          <div className="rank-bar-wrap">
+                            <div className="rank-bar" style={{width: `${pctVal}%`}}></div>
+                            <span>{pctVal}%</span>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ===================== 統計報表頁 ===================== */
+async function fetchStatsReport(token, start, end, spId) {
+  const r = await fetch(`${SUPA_URL}/rest/v1/rpc/stats_report`, {
+    method: "POST",
+    headers: { apikey: ANON, Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ p_start: start, p_end: end, p_sp_id: spId || null }),
+  });
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.message || "查詢失敗");
+  return d;
+}
+
+function StatsPage({ session }) {
+  const { token } = session;
+  const defRange = { start: monthStart(), end: today() };
+  const [range, setRange] = useState(defRange);
+  const [spFilter, setSpFilter] = useState(""); // "" = 全部
+  const [spList, setSpList] = useState([]);
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState("");
+  const [chartKey, setChartKey] = useState("order_count"); // order_count | rmb_total | twd_total | weight_total
+
+  useEffect(() => {
+    rest("salespersons?select=id,name,promo_code&is_active=eq.true&order=name.asc", { token })
+      .then(rows => setSpList(rows || [])).catch(() => {});
+  }, []);
+
+  useEffect(() => { load(); }, [range, spFilter]);
+
+  const load = async () => {
+    setLoading(true); setErr("");
+    try {
+      const d = await fetchStatsReport(token, range.start, range.end, spFilter || null);
+      setData(d);
+    } catch (e) { setErr(e.message); }
+    setLoading(false);
+  };
+
+  const daily = data?.daily || [];
+  const totals = data?.totals || {};
+  const newUsers = data?.new_users || 0;
+
+  const csvHeaders = [
+    { key: "day",          label: "日期" },
+    { key: "order_count",  label: "訂單數" },
+    { key: "rmb_total",    label: "RMB金額" },
+    { key: "twd_total",    label: "TWD金額" },
+    { key: "weight_total", label: "重量(kg)" },
+    { key: "user_count",   label: "下單用戶數" },
+  ];
+  const handleExport = () => {
+    if (!daily.length) return;
+    exportCsv(daily, csvHeaders, `雲橋集運統計_${range.start}_${range.end}.csv`);
+  };
+
+  const chartOptions = [
+    { key: "order_count",  label: "每日訂單數" },
+    { key: "rmb_total",    label: "每日 RMB 金額" },
+    { key: "twd_total",    label: "每日 TWD 金額" },
+    { key: "weight_total", label: "每日重量(kg)" },
+  ];
+
+  return (
+    <div>
+      <div className="page-h-row">
+        <h2 className="page-t">統計報表</h2>
+        <button className="btn ghost" onClick={handleExport} disabled={!daily.length}>📥 匯出 CSV</button>
+      </div>
+
+      {/* 篩選列 */}
+      <div className="stats-filters">
+        <DateRangePicker value={range} onChange={setRange} />
+        <select className="stats-sp-select" value={spFilter} onChange={e => setSpFilter(e.target.value)}>
+          <option value="">全部（含自然流量）</option>
+          <option value="__organic__" disabled>── 自然流量（待開發）──</option>
+          {spList.map(sp => <option key={sp.id} value={sp.id}>{sp.name}（{sp.promo_code}）</option>)}
+        </select>
+      </div>
+
+      {err && <div className="err">{err}</div>}
+      {loading && <div className="muted">查詢中…</div>}
+
+      {/* KPI 卡片列 */}
+      {data && (
+        <>
+          <div className="kpi-grid" style={{ marginTop: 16 }}>
+            <KpiCard label="總訂單數"   value={totals.total_orders}     highlight />
+            <KpiCard label="已完成訂單" value={totals.completed_orders} sub={`完成率 ${totals.total_orders ? Math.round((totals.completed_orders/totals.total_orders)*100) : 0}%`} />
+            <KpiCard label="RMB 總收入" value={`¥${Number(totals.total_rmb || 0).toFixed(2)}`} highlight />
+            <KpiCard label="TWD 總收入" value={`NT$${Number(totals.total_twd || 0).toFixed(2)}`} highlight />
+            <KpiCard label="總重量"     value={`${Number(totals.total_weight || 0).toFixed(2)}kg`} />
+            <KpiCard label="下單用戶數" value={totals.active_users} sub={`新用戶 ${newUsers} 位（按註冊時間）`} />
+            <KpiCard label="宅配訂單"   value={totals.home_orders} />
+            <KpiCard label="7-11 訂單"  value={totals.orders_711} />
+          </div>
+
+          {/* 折線圖 */}
+          {daily.length > 0 && (
+            <div className="card" style={{ marginTop: 16 }}>
+              <div className="chart-ctrl">
+                <div className="chart-ctrl-title">趨勢圖</div>
+                <div className="chart-ctrl-tabs">
+                  {chartOptions.map(o => (
+                    <button key={o.key} className={"chart-tab" + (chartKey === o.key ? " on" : "")} onClick={() => setChartKey(o.key)}>{o.label}</button>
+                  ))}
+                </div>
+              </div>
+              <LineChart data={daily} keyX="day" keyY={chartKey} label={chartOptions.find(o=>o.key===chartKey)?.label} />
+            </div>
+          )}
+
+          {/* 日期明細表 */}
+          <div className="card" style={{ marginTop: 16 }}>
+            <div className="tbl-head-row">
+              <b>每日明細（{daily.length} 天）</b>
+            </div>
+            {daily.length === 0 ? <div className="empty">該時段無付款訂單</div> : (
+              <table className="tbl">
+                <thead><tr><th>日期</th><th>訂單數</th><th>RMB 金額</th><th>TWD 金額</th><th>重量(kg)</th><th>下單用戶</th></tr></thead>
+                <tbody>
+                  {daily.map(d => (
+                    <tr key={d.day}>
+                      <td className="mono">{d.day}</td>
+                      <td><b>{d.order_count}</b></td>
+                      <td>¥{Number(d.rmb_total || 0).toFixed(2)}</td>
+                      <td>NT${Number(d.twd_total || 0).toFixed(2)}</td>
+                      <td>{Number(d.weight_total || 0).toFixed(2)}</td>
+                      <td>{d.user_count}</td>
+                    </tr>
+                  ))}
+                  {/* 合計行 */}
+                  <tr className="tbl-total">
+                    <td><b>合計</b></td>
+                    <td><b>{totals.total_orders}</b></td>
+                    <td><b>¥{Number(totals.total_rmb || 0).toFixed(2)}</b></td>
+                    <td><b>NT${Number(totals.total_twd || 0).toFixed(2)}</b></td>
+                    <td><b>{Number(totals.total_weight || 0).toFixed(2)}</b></td>
+                    <td><b>{totals.active_users}</b></td>
+                  </tr>
+                </tbody>
+              </table>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ===================== 倉庫作業 ===================== */
+function Warehouse({ session, has, flash, initialSub }) {
+  const subs = [
+    { k: "intake", label: "掃碼到倉", on: has("warehouse.scan") || has("warehouse.weigh") },
+    { k: "abnormal", label: "異常包裹", on: has("warehouse.abnormal") },
+    { k: "shelves", label: "貨架管理", on: has("warehouse.shelf") },
+  ].filter((s) => s.on);
+  const defKey = (initialSub && subs.find((s) => s.k === initialSub)) ? initialSub : (subs[0]?.k || "intake");
+  const [sub, setSub] = useState(defKey);
+  return (
+    <div className="wh-wrap">
+      <h2 className="page-t">倉庫作業</h2>
+      <div className="subtabs">{subs.map((s) => <button key={s.k} className={"subtab " + (sub === s.k ? "on" : "")} onClick={() => setSub(s.k)}>{s.label}</button>)}</div>
+      {sub === "intake" && <Intake session={session} has={has} flash={flash} />}
+      {sub === "abnormal" && <Abnormal session={session} flash={flash} />}
+      {sub === "shelves" && <Shelves session={session} flash={flash} />}
+    </div>
+  );
+}
+
+function Scanner({ onDetect, onClose }) {
+  const videoRef = useRef(null);
+  const [on, setOn] = useState(false);
+  const [err, setErr] = useState("");
+  const [info, setInfo] = useState("");
+  const streamRef = useRef(null);
+  const timerNativeRef = useRef(null);
+  const zxingControlsRef = useRef(null);
+  const detectedRef = useRef(false);
+
+  const stop = () => {
+    detectedRef.current = false;
+    if (timerNativeRef.current) { clearInterval(timerNativeRef.current); timerNativeRef.current = null; }
+    if (zxingControlsRef.current) { try { zxingControlsRef.current.stop(); } catch (e) {} zxingControlsRef.current = null; }
+    if (streamRef.current) { streamRef.current.getTracks().forEach((t) => t.stop()); streamRef.current = null; }
+    if (videoRef.current) { try { videoRef.current.srcObject = null; } catch (e) {} }
+    setOn(false);
+  };
+
+  const detected = (code) => {
+    if (!code || detectedRef.current) return;
+    detectedRef.current = true;
+    try { navigator.vibrate && navigator.vibrate(80); } catch (e) {}
+    setInfo(`✓ 掃到：${code}`);
+    stop();
+    onDetect(String(code).trim());
+  };
+
+  const start = async () => {
+    setErr(""); setInfo("正在啟動相機…");
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setErr("此瀏覽器不支援相機。請改用 Chrome／Safari，並以 HTTPS 開啟。"); setInfo(""); return;
+    }
+    setOn(true);
+    await new Promise((r) => setTimeout(r, 80));
+    try {
+      const ua = navigator.userAgent || "";
+      const isiOS = /iPhone|iPad|iPod/i.test(ua);
+      const baseConstraints = { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } };
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: { ...baseConstraints, facingMode: { exact: "environment" } }, audio: false });
+      } catch (e) {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({ video: { ...baseConstraints, facingMode: { ideal: "environment" } }, audio: false });
+        } catch (e2) {
+          stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        }
+      }
+      streamRef.current = stream;
+      const v = videoRef.current;
+      if (!v) throw new Error("video 元素未就緒");
+      v.setAttribute("playsinline", "true"); v.setAttribute("muted", "true");
+      v.muted = true; v.autoplay = true; v.playsInline = true;
+      v.srcObject = stream;
+      await v.play().catch(() => {});
+
+      try {
+        const track = stream.getVideoTracks()[0];
+        const caps = track.getCapabilities ? track.getCapabilities() : {};
+        const adv = [];
+        if (caps.focusMode && caps.focusMode.includes("continuous")) adv.push({ focusMode: "continuous" });
+        if (adv.length) await track.applyConstraints({ advanced: adv });
+      } catch (e) {}
+
+      setInfo("對準快遞條碼，自動辨識中…");
+
+      const hasNative = "BarcodeDetector" in window;
+      let nativeWorks = false;
+
+      if (hasNative && !isiOS) {
+        try {
+          const formats = ["code_128", "ean_13", "ean_8", "code_39", "qr_code", "upc_a", "upc_e", "itf", "codabar"];
+          let supported = formats;
+          try { supported = await window.BarcodeDetector.getSupportedFormats(); } catch (e) {}
+          const useFormats = formats.filter((f) => supported.includes(f));
+          const det = new window.BarcodeDetector({ formats: useFormats.length ? useFormats : undefined });
+          timerNativeRef.current = setInterval(async () => {
+            if (detectedRef.current || !v.videoWidth) return;
+            try { const codes = await det.detect(v); if (codes && codes.length) detected(codes[0].rawValue); } catch (e) {}
+          }, 100);
+          nativeWorks = true;
+        } catch (e) {}
+      }
+
+      const needZX = isiOS || !nativeWorks;
+      if (needZX) {
+        setInfo("正在載入辨識函式庫…若太慢請直接看畫面手動輸入單號");
+        const zok = await ensureZXing();
+        if (zok && window.ZXingBrowser) {
+          try {
+            const ZX = window.ZXingBrowser;
+            const reader = new ZX.BrowserMultiFormatReader();
+            const controls = await reader.decodeFromVideoElementContinuously(v, (result, e) => {
+              if (detectedRef.current) return;
+              if (result) detected(result.getText());
+            });
+            zxingControlsRef.current = controls;
+            setInfo("對準快遞條碼，自動辨識中…");
+          } catch (e) {
+            setInfo("自動辨識暫不可用，請對準條碼看著畫面，把單號手動輸入到上方欄位。");
+          }
+        } else {
+          setInfo("自動辨識暫不可用，請對準條碼看著畫面，把單號手動輸入到上方欄位即可。");
+        }
+      }
+    } catch (e) {
+      const msg = e?.name === "NotAllowedError" ? "已拒絕相機權限，請到瀏覽器設定允許後再試。" :
+                  e?.name === "NotFoundError" ? "找不到相機。" :
+                  ("無法開啟相機：" + (e?.message || ""));
+      setErr(msg); setInfo(""); stop();
+    }
+  };
+
+  // 元件掛載即自動啟動相機，不需二次點擊
+  useEffect(() => { start(); return () => stop(); }, []);
+
+  const handleClose = () => { stop(); onClose && onClose(); };
+
+  return (
+    <div className="scanner">
+      {on && (
+        <div className="scan-frame">
+          <video ref={videoRef} className="scan-video" muted playsInline autoPlay />
+          <div className="scan-line" />
+          <button type="button" className="scan-close" onClick={handleClose} aria-label="關閉掃描">✕</button>
+        </div>
+      )}
+      {info && <div className="scan-info">{info}</div>}
+      {err && (
+        <>
+          <div className="err">{err}</div>
+          <button type="button" className="btn ghost" onClick={handleClose}>關閉</button>
+        </>
+      )}
+      <div className="hint">支援 EAN／Code128／Code39／UPC／QR／Codabar 等主流條碼。需以 HTTPS 開啟並允許相機權限。</div>
+    </div>
+  );
+}
+
+function Intake({ session, has, flash }) {
+  const { token } = session;
+  const [tracking, setTracking] = useState("");
+  const [state, setState] = useState(null); // {kind:'matched',pkg,user,batch,suggest} | {kind:'done',pkg} | {kind:'notfound'}
+  const [busy, setBusy] = useState(false);
+  const [scanOn, setScanOn] = useState(false);
+
+  const lookup = async (t) => {
+    const code = (t ?? tracking).trim(); if (!code) return;
+    setBusy(true); setState(null);
+    try {
+      const rows = await rest(`packages?tracking_no=eq.${encodeURIComponent(code)}&select=*&order=created_at.desc`, { token });
+      const pkg = rows && rows[0];
+      if (!pkg) { setState({ kind: "notfound", tracking: code }); }
+      else if (pkg.status === "pending" && pkg.user_id) {
+        const [u] = await rest(`app_users?id=eq.${pkg.user_id}&select=*`, { token });
+        const batch = await rest(`packages?user_id=eq.${pkg.user_id}&select=*&order=created_at.asc`, { token });
+        const suggest = batch.find((b) => b.shelf_code)?.shelf_code || "";
+        setState({ kind: "matched", pkg, user: u, batch, suggest });
+      } else { setState({ kind: "done", pkg }); }
+    } catch (e) { flash(e.message); }
+    setBusy(false);
+  };
+
+  return (
+    <div>
+      <div className="card">
+        <div className="fld-label">掃描或輸入快遞單號</div>
+        <div className="coupon-row" style={{ marginTop: 6 }}>
+          <input className="mono" placeholder="快遞單號" value={tracking} onChange={(e) => setTracking(e.target.value)} onKeyDown={(e) => e.key === "Enter" && lookup()} />
+          {has("warehouse.scan") && <button className="btn scan-btn" type="button" onClick={() => setScanOn(true)}>📷 掃條碼</button>}
+          <button className="btn primary" disabled={busy} onClick={() => lookup()}>{busy ? "查詢中…" : "查詢"}</button>
+        </div>
+        {scanOn && has("warehouse.scan") && (
+          <div style={{ marginTop: 12 }}>
+            <Scanner onDetect={(c) => { setTracking(c); setScanOn(false); lookup(c); }} onClose={() => setScanOn(false)} />
+          </div>
+        )}
+      </div>
+
+      {state?.kind === "notfound" && has("warehouse.abnormal") && (
+        <WeighForm title="查無此單號 → 建立異常包裹" abnormal tracking={state.tracking} token={token}
+          onDone={() => { flash("已建立異常包裹"); setState(null); setTracking(""); }} />
+      )}
+      {state?.kind === "notfound" && !has("warehouse.abnormal") && (
+        <div className="warn">查無此單號，且你沒有「處理異常包裹」權限。</div>
+      )}
+
+      {state?.kind === "done" && (
+        <div className="card"><div className="ok">此單號已處理：{PKG_LABEL[state.pkg.status]}，重量 {state.pkg.weight ?? "—"} kg，貨架 {state.pkg.shelf_code || "—"}。</div></div>
+      )}
+
+      {state?.kind === "matched" && (
+        <>
+          <div className="card user-card">
+            <div className="uc-h"><b>{state.user?.username}</b><span className="mono small">{state.user?.country_code?.replace("-CA","")} {state.user?.phone}</span></div>
+            <div className="small">本批包裹（{state.batch.length} 件）：</div>
+            <div className="batch">
+              {state.batch.map((b) => (
+                <div key={b.id} className={"batch-row " + (b.id === state.pkg.id ? "cur" : "")}>
+                  <span className="mono small">{b.tracking_no}</span>
+                  <span className={"chip " + (b.status === "arrived" ? "chip-leaf" : b.status === "pending" ? "chip-grey" : "chip-sea")}>{PKG_LABEL[b.status]}</span>
+                  {b.shelf_code && <span className="shelf">貨架 {b.shelf_code}</span>}
+                </div>
+              ))}
+            </div>
+            {state.suggest && <div className="suggest">📍 此用戶已有包裹在貨架 <b>{state.suggest}</b>，建議集中放同一貨架</div>}
+          </div>
+          <WeighForm title="秤重・拍照・上架" pkg={state.pkg} suggest={state.suggest} token={token}
+            onDone={() => { flash("已完成上架，用戶可看到重量與照片"); setState(null); setTracking(""); }} />
+        </>
+      )}
+    </div>
+  );
+}
+
+function WeighForm({ title, pkg, abnormal, tracking, suggest, token, onDone }) {
+  const [weight, setWeight] = useState("");
+  const [shelf, setShelf] = useState(suggest || "");
+  const [product, setProduct] = useState("");
+  const [file, setFile] = useState(null);
+  const [preview, setPreview] = useState(null);
+  const [shelves, setShelves] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  useEffect(() => { (async () => { try { setShelves(await rest("shelves?select=code&order=code.asc", { token })); } catch (e) {} })(); }, []);
+  const onFile = (e) => { const f = e.target.files?.[0]; if (f) { setFile(f); setPreview(URL.createObjectURL(f)); } };
+  const submit = async () => {
+    setErr("");
+    const w = parseFloat(weight);
+    if (!(w > 0)) return setErr("請輸入正確重量");
+    if (!shelf) return setErr("請選擇或輸入貨架");
+    setBusy(true);
+    try {
+      let photo_url = null;
+      if (file) photo_url = await uploadPkgPhoto(file, token);
+      if (abnormal) {
+        await rest("packages", { token, method: "POST", prefer: "return=minimal", body: { tracking_no: tracking, product_name: product || null, is_abnormal: true, status: "abnormal", weight: w, shelf_code: shelf, photo_url, arrived_at: new Date().toISOString() } });
+      } else {
+        await rest(`packages?id=eq.${pkg.id}`, { token, method: "PATCH", prefer: "return=minimal", body: { status: "arrived", weight: w, shelf_code: shelf, photo_url, arrived_at: new Date().toISOString() } });
+      }
+      onDone();
+    } catch (e) { setErr(e.message); }
+    setBusy(false);
+  };
+  return (
+    <div className="card weigh">
+      <div className="weigh-h">{title}</div>
+      {abnormal && <label className="fld"><span>商品名稱（選填）</span><input value={product} onChange={(e) => setProduct(e.target.value)} placeholder="不確定可留空" /></label>}
+      <div className="form-grid2">
+        <label className="fld"><span>重量（公斤）</span><input className="mono" inputMode="decimal" value={weight} onChange={(e) => setWeight(e.target.value)} placeholder="例：0.85" /></label>
+        <label className="fld"><span>貨架</span>
+          <input list="shelflist" value={shelf} onChange={(e) => setShelf(e.target.value)} placeholder="例：A1" />
+          <datalist id="shelflist">{shelves.map((s) => <option key={s.code} value={s.code} />)}</datalist>
+        </label>
+      </div>
+      <label className="upload">{preview ? <img src={preview} alt="pkg" /> : <span>📷 拍照 / 上傳包裹照片</span>}<input type="file" accept="image/*" capture="environment" onChange={onFile} hidden /></label>
+      {err && <div className="err">{err}</div>}
+      <button className="btn primary block" disabled={busy} onClick={submit}>{busy ? "處理中…" : abnormal ? "建立異常包裹" : "完成上架"}</button>
+    </div>
+  );
+}
+
+function Abnormal({ session, flash }) {
+  const { token } = session;
+  const [list, setList] = useState(null);
+  const [assignId, setAssignId] = useState(null);
+  const load = async () => { try { setList(await rest("packages?is_abnormal=eq.true&select=*&order=created_at.desc", { token })); } catch (e) { flash(e.message); } };
+  useEffect(() => { load(); }, []);
+  if (!list) return <div className="muted">載入中…</div>;
+  if (!list.length) return <div className="empty big">目前沒有異常包裹 🎉</div>;
+  return (
+    <div className="admin-list">
+      {list.map((p) => (
+        <div className="card" key={p.id}>
+          <div className="ac-id"><b className="mono">{p.tracking_no}</b><span className="chip chip-alert">異常</span>{p.shelf_code && <span className="shelf">貨架 {p.shelf_code}</span>}</div>
+          <div className="small">{p.product_name || "（未命名）"} · {p.weight ?? "—"} kg · {new Date(p.created_at).toLocaleString("zh-TW")}</div>
+          {p.photo_url && <img className="abn-photo" src={p.photo_url} alt="pkg" />}
+          {assignId === p.id ? <AssignBox token={token} pkg={p} flash={flash} onDone={() => { setAssignId(null); load(); }} onCancel={() => setAssignId(null)} />
+            : <div className="ac-actions"><button className="btn tiny" onClick={() => setAssignId(p.id)}>指派給用戶</button></div>}
+          <div className="hint">用戶之後若自行錄入此單號，系統會自動歸戶並移出異常清單。</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function AssignBox({ token, pkg, flash, onDone, onCancel }) {
+  const [phone, setPhone] = useState(""); const [found, setFound] = useState(null); const [busy, setBusy] = useState(false); const [err, setErr] = useState("");
+  const search = async () => {
+    setErr(""); setFound(null);
+    try { const u = await rest(`app_users?phone=eq.${encodeURIComponent(phone.trim())}&select=*`, { token }); if (!u?.[0]) return setErr("查無此手機號用戶"); setFound(u[0]); }
+    catch (e) { setErr(e.message); }
+  };
+  const assign = async () => {
+    setBusy(true);
+    try {
+      await rest(`packages?id=eq.${pkg.id}`, { token, method: "PATCH", prefer: "return=minimal", body: { user_id: found.id, is_abnormal: false, status: pkg.weight ? "arrived" : "pending" } });
+      flash(`已指派給 ${found.username}`); onDone();
+    } catch (e) { setErr(e.message); }
+    setBusy(false);
+  };
+  return (
+    <div className="form-box">
+      <div className="coupon-row"><input className="mono" placeholder="用戶手機號" value={phone} onChange={(e) => setPhone(e.target.value)} /><button className="btn" onClick={search}>搜尋</button></div>
+      {err && <div className="err">{err}</div>}
+      {found && <div className="ok">找到：{found.username}（{found.phone}）</div>}
+      <div className="form-actions"><button className="btn ghost" onClick={onCancel}>取消</button><button className="btn primary" disabled={!found || busy} onClick={assign}>{busy ? "指派中…" : "確認指派"}</button></div>
+    </div>
+  );
+}
+
+function Shelves({ session, flash }) {
+  const { token } = session;
+  const [list, setList] = useState(null);
+  const [code, setCode] = useState(""); const [desc, setDesc] = useState("");
+  const load = async () => { try { setList(await rest("shelves?select=*&order=code.asc", { token })); } catch (e) { flash(e.message); } };
+  useEffect(() => { load(); }, []);
+  const add = async () => {
+    if (!code.trim()) return flash("請輸入貨架編號");
+    try { await rest("shelves", { token, method: "POST", prefer: "return=minimal", body: { code: code.trim().toUpperCase(), description: desc || null } }); setCode(""); setDesc(""); flash("已新增貨架"); load(); }
+    catch (e) { flash(e.message); }
+  };
+  const del = async (c) => { try { await rest(`shelves?code=eq.${encodeURIComponent(c)}`, { token, method: "DELETE", prefer: "return=minimal" }); load(); } catch (e) { flash(e.message); } };
+  if (!list) return <div className="muted">載入中…</div>;
+  return (
+    <div>
+      <div className="card">
+        <div className="form-grid2">
+          <label className="fld"><span>貨架編號</span><input value={code} onChange={(e) => setCode(e.target.value)} placeholder="例：A4" /></label>
+          <label className="fld"><span>說明（選填）</span><input value={desc} onChange={(e) => setDesc(e.target.value)} placeholder="例：A 區 4 架" /></label>
+        </div>
+        <button className="btn primary block" onClick={add}>＋ 新增貨架</button>
+      </div>
+      <div className="shelf-grid">
+        {list.map((s) => <div className="shelf-card" key={s.code}><div><b>{s.code}</b><div className="small">{s.description || ""}</div></div><button className="x" onClick={() => del(s.code)}>✕</button></div>)}
+      </div>
+    </div>
+  );
+}
+
+/* ===================== 財務 ===================== */
+function FinancePage({ session, has, flash, initialSub, initialFilter }) {
+  const [today, setToday] = useState(null);
+  const loadToday = async () => {
+    try { const r = await fetch(`${SUPA_URL}/rest/v1/rpc/finance_today`, { method: "POST", headers: { apikey: ANON, Authorization: `Bearer ${session.token}`, "Content-Type": "application/json" }, body: "{}" }); const d = await r.json(); if (r.ok) setToday(d); }
+    catch (e) {}
+  };
+  useEffect(() => { loadToday(); const t = setInterval(loadToday, 15000); return () => clearInterval(t); }, []);
+  const tabs = [
+    has("finance.verify") && { k: "review", label: "待確認付款" },
+    has("finance.orders") && { k: "orders", label: "全部訂單" },
+  ].filter(Boolean);
+  const defKey = (initialSub && tabs.find((t) => t.k === initialSub)) ? initialSub : (tabs[0]?.k || "orders");
+  const [tab, setTab] = useState(defKey);
+  const [ordFilter, setOrdFilter] = useState(null);
+  return (
+    <div>
+      <h2 className="page-t">財務</h2>
+      {today && (
+        <div className="ov-grid finance-today">
+          <button className="ov-card clickable leaf" type="button" onClick={() => { setTab("orders"); setOrdFilter("today_paid"); }}>
+            <span>今日訂單數</span><b>{today.orders_count}</b><i>已付款</i><em className="ov-go">查看今日訂單 →</em>
+          </button>
+          <button className="ov-card clickable" type="button" onClick={() => { setTab("orders"); setOrdFilter("today_paid"); }}>
+            <span>今日總重量</span><b>{Number(today.total_weight_kg).toFixed(3)}</b><i>kg（已付款）</i><em className="ov-go">查看明細 →</em>
+          </button>
+          <button className="ov-card clickable gold" type="button" onClick={() => { setTab("orders"); setOrdFilter("today_paid_rmb"); }}>
+            <span>今日收款 (RMB)</span><b>¥{Number(today.amount_rmb).toFixed(2)}</b><i>宅配</i><em className="ov-go">查看訂單 →</em>
+          </button>
+          <button className="ov-card clickable gold" type="button" onClick={() => { setTab("orders"); setOrdFilter("today_paid_twd"); }}>
+            <span>今日收款 (TWD)</span><b>NT${Number(today.amount_twd).toFixed(2)}</b><i>7-11</i><em className="ov-go">查看訂單 →</em>
+          </button>
+          <button className="ov-card clickable warn" type="button" onClick={() => setTab("review")}>
+            <span>待確認付款</span><b>{today.pending_review}</b><i>需核對</i><em className="ov-go">立即處理 →</em>
+          </button>
+          <button className="ov-card clickable sea" type="button" onClick={() => { setTab("orders"); setOrdFilter("today_shipped"); }}>
+            <span>今日已出貨</span><b>{today.shipped_today}</b><i>—</i><em className="ov-go">查看明細 →</em>
+          </button>
+        </div>
+      )}
+      <div className="subtabs">{tabs.map((t) => <button key={t.k} className={"subtab " + (tab === t.k ? "on" : "")} onClick={() => { setTab(t.k); setOrdFilter(null); }}>{t.label}</button>)}</div>
+      {tab === "review" && <PaymentReview session={session} flash={flash} onChange={loadToday} />}
+      {tab === "orders" && <OrdersList session={session} flash={flash} initialFilter={ordFilter || initialFilter} />}
+    </div>
+  );
+}
+
+function PaymentReview({ session, flash, onChange }) {
+  const { token } = session;
+  const [list, setList] = useState(null);
+  const [previews, setPreviews] = useState({});
+  const load = async () => {
+    try {
+      const s = await rest("shipments?status=eq.payment_review&select=*&order=created_at.asc", { token });
+      setList(s);
+      const ids = Array.from(new Set(s.map((x) => x.user_id)));
+      if (ids.length) {
+        const us = await rest(`app_users?id=in.(${ids.join(",")})&select=id,username,country_code,phone`, { token });
+        const map = Object.fromEntries(us.map((u) => [u.id, u]));
+        s.forEach((x) => (x._user = map[x.user_id]));
+        setList([...s]);
+      }
+    } catch (e) { flash(e.message); }
+  };
+  useEffect(() => { load(); }, []);
+  const sign = async (id, path) => {
+    if (!path) return;
+    try { const r = await ops("signScreenshot", { path }, token); setPreviews((p) => ({ ...p, [id]: r.url })); }
+    catch (e) { flash(e.message); }
+  };
+  const decide = async (id, approve) => {
+    try { await ops("verifyPayment", { id, approve }, token); flash(approve ? "已確認付款 → 進入打包中" : "已退回付款"); load(); onChange && onChange(); }
+    catch (e) { flash(e.message); }
+  };
+  if (!list) return <div className="muted">載入中…</div>;
+  if (!list.length) return <div className="empty big">目前沒有待確認的付款 🎉</div>;
+  return (
+    <div className="admin-list">
+      {list.map((o) => (
+        <div className="card order" key={o.id}>
+          <div className="order-h"><span className="mono">{o.order_no}</span><span className="chip chip-grey">待確認付款</span></div>
+          <div className="small">{o._user?.username || "—"} · {o._user?.country_code?.replace("-CA","")} {o._user?.phone} · {o.delivery_type === "home" ? "宅配" : "7-11"} · {o.total_weight}kg</div>
+          <div className="order-pay"><span>應收 / 已上傳付款方式</span><b className="mono">{o.currency === "TWD" ? "NT$" : "¥"}{o.freight_amount} · {o.payment_method}</b></div>
+          {o.payment_screenshot_url && (previews[o.id] ? <img className="shot" src={previews[o.id]} alt="截圖" /> : <button className="btn tiny" onClick={() => sign(o.id, o.payment_screenshot_url)}>查看付款截圖</button>)}
+          <div className="ac-actions">
+            <button className="btn primary tiny" onClick={() => decide(o.id, true)}>✓ 確認收款</button>
+            <button className="btn tiny danger" onClick={() => decide(o.id, false)}>退回（重新付款）</button>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function OrdersList({ session, flash, initialFilter }) {
+  const { token } = session;
+  const [filter, setFilter] = useState(initialFilter || "all");
+  useEffect(() => { setFilter(initialFilter || "all"); }, [initialFilter]);
+  const [list, setList] = useState(null);
+  const FS = [
+    { k: "all", label: "全部" },
+    { k: "awaiting_payment", label: "待付款" },
+    { k: "payment_review", label: "待確認" },
+    { k: "packing", label: "打包中" },
+    { k: "shipped", label: "已出貨" },
+    { k: "today_paid", label: "今日已付款" },
+    { k: "today_shipped", label: "今日已出貨" },
+  ];
+  const todayIso = () => { const d = new Date(); d.setHours(0,0,0,0); return encodeURIComponent(d.toISOString()); };
+  const load = async () => {
+    try {
+      let q = "shipments?select=*&order=created_at.desc&limit=50";
+      if (filter === "all") q = "shipments?select=*&order=created_at.desc&limit=50";
+      else if (filter === "today_paid") q = `shipments?status=in.(packing,shipped,completed)&paid_at=gte.${todayIso()}&select=*&order=paid_at.desc&limit=100`;
+      else if (filter === "today_paid_rmb") q = `shipments?status=in.(packing,shipped,completed)&currency=eq.RMB&paid_at=gte.${todayIso()}&select=*&order=paid_at.desc&limit=100`;
+      else if (filter === "today_paid_twd") q = `shipments?status=in.(packing,shipped,completed)&currency=eq.TWD&paid_at=gte.${todayIso()}&select=*&order=paid_at.desc&limit=100`;
+      else if (filter === "today_shipped") q = `shipments?status=eq.shipped&shipped_at=gte.${todayIso()}&select=*&order=shipped_at.desc&limit=100`;
+      else q = `shipments?status=eq.${filter}&select=*&order=created_at.desc&limit=50`;
+      const s = await rest(q, { token });
+      const ids = Array.from(new Set(s.map((x) => x.user_id)));
+      if (ids.length) {
+        const us = await rest(`app_users?id=in.(${ids.join(",")})&select=id,username,phone`, { token });
+        const map = Object.fromEntries(us.map((u) => [u.id, u]));
+        s.forEach((x) => (x._user = map[x.user_id]));
+      }
+      setList(s);
+    } catch (e) { flash(e.message); }
+  };
+  useEffect(() => { load(); }, [filter]);
+  const LBL = { awaiting_payment: "待付款", payment_review: "待確認付款", packing: "打包中", shipped: "已出貨", completed: "已完成", cancelled: "已取消" };
+  const totalWeight = list ? list.reduce((s, o) => s + Number(o.total_weight || 0), 0) : 0;
+  const totalAmount = list ? list.reduce((acc, o) => { acc[o.currency] = (acc[o.currency] || 0) + Number(o.freight_amount || 0); return acc; }, {}) : {};
+  return (
+    <div>
+      <div className="subtabs">{FS.map((f) => <button key={f.k} className={"subtab " + (filter === f.k ? "on" : "")} onClick={() => setFilter(f.k)}>{f.label}</button>)}</div>
+      {list && list.length > 0 && (filter.startsWith("today_") || filter === "shipped") && (
+        <div className="ord-sum">共 {list.length} 筆 · 重量 {totalWeight.toFixed(3)} kg{totalAmount.RMB ? ` · RMB ¥${totalAmount.RMB.toFixed(2)}` : ""}{totalAmount.TWD ? ` · TWD NT$${totalAmount.TWD.toFixed(2)}` : ""}</div>
+      )}
+      {!list ? <div className="muted">載入中…</div> : list.length === 0 ? <div className="empty big">沒有資料</div> : (
+        <div className="admin-list">
+          {list.map((o) => (
+            <div className="card order" key={o.id}>
+              <div className="order-h"><span className="mono">{o.order_no}</span><span className="chip chip-grey">{LBL[o.status] || o.status}</span></div>
+              <div className="small">{o._user?.username || "—"} · {o.delivery_type === "home" ? "宅配" : "7-11"} · {o.total_weight}kg · {new Date(o.created_at).toLocaleString("zh-TW")}</div>
+              <div className="order-pay"><span>金額</span><b className="mono">{o.currency === "TWD" ? "NT$" : "¥"}{o.freight_amount}</b></div>
+              {o.return_tracking_no && <div className="small mono">{o.return_carrier || (o.delivery_type==="711"?"7-ELEVEN":"新竹物流")} · {o.return_tracking_no}</div>}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ===================== 打包出貨 ===================== */
+function PackOps({ session, flash }) {
+  const { token } = session;
+  const [list, setList] = useState(null);
+  const [openId, setOpenId] = useState(null);
+  const load = async () => {
+    try {
+      const s = await rest("shipments?status=eq.packing&select=*&order=paid_at.asc.nullslast,created_at.asc", { token });
+      const ids = Array.from(new Set(s.map((x) => x.user_id)));
+      let users = {};
+      if (ids.length) { const us = await rest(`app_users?id=in.(${ids.join(",")})&select=id,username,phone`, { token }); users = Object.fromEntries(us.map((u) => [u.id, u])); }
+      const sids = s.map((x) => x.id);
+      let pkgs = [];
+      if (sids.length) pkgs = await rest(`packages?shipment_id=in.(${sids.join(",")})&select=*`, { token });
+      const grp = pkgs.reduce((m, p) => ((m[p.shipment_id] = m[p.shipment_id] || []).push(p), m), {});
+      s.forEach((x) => { x._user = users[x.user_id]; x._items = grp[x.id] || []; });
+      setList(s);
+    } catch (e) { flash(e.message); }
+  };
+  useEffect(() => { load(); }, []);
+  if (!list) return <div><h2 className="page-t">打包出貨</h2><div className="muted">載入中…</div></div>;
+  return (
+    <div>
+      <h2 className="page-t">打包出貨</h2>
+      {list.length === 0 ? <div className="empty big">目前沒有待打包的訂單 🎉</div> : (
+        <div className="admin-list">
+          {list.map((o) => (
+            <div className="card pack" key={o.id}>
+              <div className="order-h"><span className="mono">{o.order_no}</span><span className="chip chip-sea">打包中</span></div>
+              <div className="small">{o._user?.username} · {o._user?.phone} · {o.delivery_type === "home" ? "宅配到府" : "7-11 取貨"} · 總重 {o.total_weight}kg</div>
+              <div className="recipient-snap">
+                <b>收件資訊</b>
+                {o.delivery_type === "home"
+                  ? <div className="small">{o.recipient_snapshot?.receiver_name} · {o.recipient_snapshot?.phone}<br/>{o.recipient_snapshot?.detail}</div>
+                  : <div className="small">7-11 {o.recipient_snapshot?.store_name}門市<br/>取貨人 {o.recipient_snapshot?.receiver_name} · {o.recipient_snapshot?.phone}<br/>{o.recipient_snapshot?.store_addr}</div>}
+              </div>
+              <div className="pack-items">
+                <b>本單包裹（{o._items.length} 件）</b>
+                {o._items.map((p) => <div key={p.id} className="batch-row"><span className="mono small">{p.tracking_no}</span><span className="small">{p.product_name}</span><span className="mono small">{p.weight}kg</span>{p.shelf_code && <span className="shelf">{p.shelf_code}</span>}</div>)}
+              </div>
+              <div className="order-pay"><span>已收金額</span><b className="mono">{o.currency === "TWD" ? "NT$" : "¥"}{o.freight_amount}</b></div>
+              {openId === o.id
+                ? <ShipForm shipment={o} token={token} onCancel={() => setOpenId(null)} onDone={() => { setOpenId(null); load(); flash("已標記出貨"); }} />
+                : <div className="ac-actions"><button className="btn primary" onClick={() => setOpenId(o.id)}>標記出貨</button></div>}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ShipForm({ shipment, token, onCancel, onDone }) {
+  const is711 = shipment.delivery_type === "711";
+  const HOME_CARRIERS = ["新竹物流", "黑貓宅急便"];
+  const [carrier, setCarrier] = useState(is711 ? "7-ELEVEN" : "新竹物流");
+  const [tracking, setTracking] = useState("");
+  const [scanOn, setScanOn] = useState(false);
+  const [file, setFile] = useState(null);
+  const [preview, setPreview] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const onFile = (e) => { const f = e.target.files?.[0]; if (f) { setFile(f); setPreview(URL.createObjectURL(f)); } };
+  const submit = async () => {
+    setErr("");
+    if (!tracking.trim()) return setErr("請填寫回台物流單號");
+    setBusy(true);
+    try {
+      let url = null;
+      if (file) { const r = await uploadTo("outbound-photos", file, token); url = r.publicUrl; }
+      await ops("markShipped", { id: shipment.id, return_tracking_no: tracking.trim(), outbound_photo_url: url, return_carrier: carrier }, token);
+      onDone();
+    } catch (e) { setErr(e.message); }
+    setBusy(false);
+  };
+  return (
+    <div className="form-box">
+      <label className="fld"><span>回台物流商</span>
+        {is711
+          ? <input className="mono" value="7-ELEVEN" disabled />
+          : (
+            <div className="seg">
+              {HOME_CARRIERS.map((c) => (
+                <button key={c} type="button" className={carrier === c ? "on" : ""} onClick={() => setCarrier(c)}>{c}</button>
+              ))}
+            </div>
+          )}
+      </label>
+      <label className="fld">
+        <span>{carrier} 單號</span>
+        <div className="track-input-row">
+          <input className="mono" value={tracking} onChange={(e) => setTracking(e.target.value)} placeholder={is711 ? "例：F12345678901" : (carrier === "黑貓宅急便" ? "例：123456789012" : "例：TWHCT12345678")} />
+          <button type="button" className="btn scan-btn" onClick={() => setScanOn(true)}>📷 掃條碼</button>
+        </div>
+      </label>
+      {scanOn && <Scanner onDetect={(code) => { setTracking(code); setScanOn(false); }} onClose={() => setScanOn(false)} />}
+      <label className="upload">{preview ? <img src={preview} alt="out" /> : <span>📷 上傳出貨前包裹照片（建議）</span>}<input type="file" accept="image/*" capture="environment" onChange={onFile} hidden /></label>
+      {err && <div className="err">{err}</div>}
+      <div className="hint">{is711 ? "7-11 取貨訂單，物流商固定為 7-ELEVEN。" : "宅配訂單預設為新竹物流，可切換為黑貓宅急便。"}可直接掃描宅配／7-11 託運單上的條碼自動帶入單號。出貨後 3–4 天物流系統才會查到動態。</div>
+      <div className="form-actions"><button className="btn ghost" onClick={onCancel}>取消</button><button className="btn primary" disabled={busy} onClick={submit}>{busy ? "處理中…" : "確認已出貨"}</button></div>
+    </div>
+  );
+}
+
+/* ===================== 營運設定 ===================== */
+function SettingsPage({ session, has, flash }) {
+  const tabs = [
+    (has("settings.rates") || has("settings.points")) && { k: "rates", label: "費率／匯率" },
+    has("settings.rates") && { k: "warehouse", label: "倉庫地址" },
+    has("settings.rates") && { k: "contact", label: "預設客服" },
+    has("finance.qr") && { k: "qr", label: "收款碼" },
+    has("settings.coupons") && { k: "coupons", label: "優惠券" },
+  ].filter(Boolean);
+  const [tab, setTab] = useState(tabs[0]?.k || "rates");
+  return (
+    <div>
+      <h2 className="page-t">營運設定</h2>
+      <div className="subtabs">{tabs.map((t) => <button key={t.k} className={"subtab " + (tab === t.k ? "on" : "")} onClick={() => setTab(t.k)}>{t.label}</button>)}</div>
+      {tab === "rates" && <RatesPanel session={session} has={has} flash={flash} />}
+      {tab === "warehouse" && <WarehousePanel session={session} flash={flash} />}
+      {tab === "contact" && <DefaultContactPanel session={session} flash={flash} />}
+      {tab === "qr" && <QrPanel session={session} flash={flash} />}
+      {tab === "coupons" && <CouponsPanel session={session} flash={flash} />}
+    </div>
+  );
+}
+
+function WarehousePanel({ session, flash }) {
+  const { token } = session;
+  const [s, setS] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const load = async () => { try { const r = await rest("settings?id=eq.1&select=warehouse_recipient,warehouse_phone,warehouse_address,warehouse_note", { token }); setS(r[0] || {}); } catch (e) { flash(e.message); } };
+  useEffect(() => { load(); }, []);
+  if (!s) return <div className="muted">載入中…</div>;
+  const upd = (k, v) => setS({ ...s, [k]: v });
+  const save = async () => {
+    setBusy(true);
+    try {
+      await ops("updateSettings", {
+        warehouse_recipient: s.warehouse_recipient || "",
+        warehouse_phone: s.warehouse_phone || "",
+        warehouse_address: s.warehouse_address || "",
+        warehouse_note: s.warehouse_note || "",
+      }, token);
+      flash("已儲存倉庫地址"); load();
+    } catch (e) { flash(e.message); }
+    setBusy(false);
+  };
+  return (
+    <div className="card">
+      <div className="hint" style={{ marginBottom: 14, lineHeight: 1.7 }}>
+        這裡設定的倉庫地址會顯示在用戶端首頁，方便用戶在大陸電商下單時填寫。<br />
+        在「收件人」與「地址」欄位中，可以使用 <b>「您的會員編號」</b> 這個字串作為佔位符，用戶看到時會自動替換為他的會員編號（邀請碼）。
+      </div>
+      <label className="fld"><span>收件人（顯示在用戶端）</span>
+        <input className="mono" value={s.warehouse_recipient || ""} onChange={(e) => upd("warehouse_recipient", e.target.value)} placeholder="例：雲橋集運倉庫 + 您的會員編號" />
+      </label>
+      <label className="fld"><span>聯絡電話</span>
+        <input className="mono" value={s.warehouse_phone || ""} onChange={(e) => upd("warehouse_phone", e.target.value)} placeholder="例：0755-00000000" />
+      </label>
+      <label className="fld"><span>倉庫地址</span>
+        <textarea className="mono" rows={3} style={{ width: "100%", border: "1.5px solid #DCD9CF", borderRadius: 11, padding: "12px 13px", fontSize: 15, fontFamily: "'Space Mono',monospace", resize: "vertical" }} value={s.warehouse_address || ""} onChange={(e) => upd("warehouse_address", e.target.value)} placeholder="例：廣東省深圳市寶安區××路××號雲橋倉 + 您的會員編號" />
+      </label>
+      <label className="fld"><span>寄件提示（顯示在用戶端地址下方）</span>
+        <textarea rows={2} style={{ width: "100%", border: "1.5px solid #DCD9CF", borderRadius: 11, padding: "12px 13px", fontSize: 15, resize: "vertical", fontFamily: "inherit" }} value={s.warehouse_note || ""} onChange={(e) => upd("warehouse_note", e.target.value)} placeholder="例：寄件時請務必在收件人後面備註您的「會員編號」" />
+      </label>
+      <button className="btn primary block" disabled={busy} onClick={save}>{busy ? "儲存中…" : "儲存倉庫地址"}</button>
+      <div className="hint">儲存後立即生效，用戶端首頁會看到最新地址。</div>
+    </div>
+  );
+}
+
+function RatesPanel({ session, has, flash }) {
+  const { token } = session;
+  const [s, setS] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const load = async () => { try { const r = await rest("settings?id=eq.1&select=*", { token }); setS(r[0]); } catch (e) { flash(e.message); } };
+  useEffect(() => { load(); }, []);
+  if (!s) return <div className="muted">載入中…</div>;
+  const upd = (k, v) => setS({ ...s, [k]: v });
+  const save = async () => {
+    setBusy(true);
+    try {
+      const body = {};
+      ["price_per_kg", "rate_rmb", "rate_twd", "fee_home", "fee_711", "max_weight_711", "credit_per_order", "points_per_nt", "referral_points"].forEach((k) => (body[k] = Number(s[k])));
+      await ops("updateSettings", body, token);
+      flash("已儲存設定"); load();
+    } catch (e) { flash(e.message); }
+    setBusy(false);
+  };
+  const can = (k) => k === "points_per_nt" || k === "referral_points" ? has("settings.points") : has("settings.rates");
+  const F = ({ k, label, suffix }) => <label className="fld"><span>{label}</span><input disabled={!can(k)} className="mono" inputMode="decimal" value={s[k]} onChange={(e) => upd(k, e.target.value)} />{suffix && <i className="suffix">{suffix}</i>}</label>;
+  return (
+    <div className="card">
+      <div className="settings-grid">
+        <F k="price_per_kg" label="每公斤運費 (RMB)" />
+        <F k="rate_rmb" label="宅配匯率（人民幣付款）" suffix="1 RMB = N TWD" />
+        <F k="rate_twd" label="7-11 匯率（台幣付款）" suffix="1 RMB = N TWD" />
+        <F k="fee_home" label="宅配派件費 (TWD)" />
+        <F k="fee_711" label="7-11 派件費 (TWD)" />
+        <F k="max_weight_711" label="7-11 重量上限 (kg)" />
+        <F k="credit_per_order" label="額度每筆折抵 (TWD)" />
+        <F k="points_per_nt" label="積分折抵比率（N 分 = 1 元）" />
+        <F k="referral_points" label="邀請積分（每位）" />
+      </div>
+      <button className="btn primary block" disabled={busy} onClick={save}>{busy ? "儲存中…" : "儲存設定"}</button>
+      <div className="hint">儲存後立即生效，用戶端的「運費試算」與下次結帳會使用新費率。</div>
+    </div>
+  );
+}
+
+function QrPanel({ session, flash }) {
+  const { token } = session;
+  const [s, setS] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const load = async () => { try { const r = await rest("settings?id=eq.1&select=payment_qr_alipay_url,payment_qr_wechat_url", { token }); setS(r[0]); } catch (e) { flash(e.message); } };
+  useEffect(() => { load(); }, []);
+  if (!s) return <div className="muted">載入中…</div>;
+  const up = async (e, kind) => {
+    const f = e.target.files?.[0]; if (!f) return;
+    setBusy(true);
+    try {
+      const r = await uploadTo("payment-qr", f, token);
+      await ops("setQrUrls", kind === "alipay" ? { alipay: r.publicUrl } : { wechat: r.publicUrl }, token);
+      flash("已更新收款碼"); load();
+    } catch (e) { flash(e.message); }
+    setBusy(false);
+  };
+  return (
+    <div className="qr-grid2">
+      {[{ kind: "alipay", label: "支付寶收款碼", url: s.payment_qr_alipay_url }, { kind: "wechat", label: "微信收款碼", url: s.payment_qr_wechat_url }].map((q) => (
+        <div className="card qr-cell" key={q.kind}>
+          <b>{q.label}</b>
+          {q.url ? <img className="qr-up" src={q.url} alt={q.label} /> : <div className="qr-empty">尚未上傳</div>}
+          <label className="btn">上傳新圖<input type="file" accept="image/*" hidden disabled={busy} onChange={(e) => up(e, q.kind)} /></label>
+          <div className="hint">用戶在付款頁會直接看到此收款碼。</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function CouponsPanel({ session, flash }) {
+  const { token } = session;
+  const [list, setList] = useState(null);
+  const [form, setForm] = useState({ code: "", discount_twd: "", label: "", usage_limit: "" });
+  const load = async () => { try { setList(await rest("coupons?select=*&order=created_at.desc", { token })); } catch (e) { flash(e.message); } };
+  useEffect(() => { load(); }, []);
+  const add = async () => {
+    if (!form.code || !form.discount_twd) return flash("請填編號與折抵金額");
+    try {
+      await rest("coupons", { token, method: "POST", prefer: "return=minimal", body: { code: form.code.trim().toUpperCase(), discount_twd: Number(form.discount_twd), label: form.label || null, usage_limit: form.usage_limit ? Number(form.usage_limit) : null, is_active: true } });
+      setForm({ code: "", discount_twd: "", label: "", usage_limit: "" }); flash("已新增優惠券"); load();
+    } catch (e) { flash(e.message); }
+  };
+  const toggle = async (c) => { try { await rest(`coupons?id=eq.${c.id}`, { token, method: "PATCH", prefer: "return=minimal", body: { is_active: !c.is_active } }); load(); } catch (e) { flash(e.message); } };
+  const updateLimit = async (c) => {
+    const cur = c.usage_limit == null ? "" : String(c.usage_limit);
+    const v = prompt(`調整「${c.code}」的發放總量（留空代表不限量）`, cur);
+    if (v === null) return;
+    const num = v.trim() === "" ? null : Number(v);
+    if (num != null && (!Number.isInteger(num) || num < 0)) return flash("請輸入非負整數");
+    if (num != null && num < (c.used_count || 0)) return flash(`不可小於已使用數量（${c.used_count}）`);
+    try { await rest(`coupons?id=eq.${c.id}`, { token, method: "PATCH", prefer: "return=minimal", body: { usage_limit: num } }); flash("已更新發放總量"); load(); }
+    catch (e) { flash(e.message); }
+  };
+  const del = async (c) => { if (!confirm(`刪除優惠券 ${c.code}？`)) return; try { await rest(`coupons?id=eq.${c.id}`, { token, method: "DELETE", prefer: "return=minimal" }); load(); } catch (e) { flash(e.message); } };
+  if (!list) return <div className="muted">載入中…</div>;
+  return (
+    <div>
+      <div className="card">
+        <div className="settings-grid">
+          <label className="fld"><span>編號（大寫英數）</span><input className="mono" value={form.code} onChange={(e) => setForm({ ...form, code: e.target.value })} placeholder="例：SUMMER50" /></label>
+          <label className="fld"><span>折抵金額 (TWD)</span><input className="mono" inputMode="decimal" value={form.discount_twd} onChange={(e) => setForm({ ...form, discount_twd: e.target.value })} /></label>
+          <label className="fld"><span>顯示名稱（選填）</span><input value={form.label} onChange={(e) => setForm({ ...form, label: e.target.value })} placeholder="例：暑期 50 元" /></label>
+          <label className="fld"><span>發放總量（張）</span><input className="mono" inputMode="numeric" value={form.usage_limit} onChange={(e) => setForm({ ...form, usage_limit: e.target.value })} placeholder="例：100；留空代表不限量" /></label>
+        </div>
+        <button className="btn primary block" onClick={add}>＋ 新增優惠券</button>
+        <div className="hint">規則：發放總量＝整張券最多可被使用幾次；無論是否設上限，<b>每位用戶都只能使用同一張券 1 次</b>（由系統自動限制）。</div>
+      </div>
+      <div className="admin-list">
+        {list.map((c) => {
+          const used = Number(c.used_count || 0);
+          const cap = c.usage_limit == null ? null : Number(c.usage_limit);
+          const left = cap == null ? null : Math.max(0, cap - used);
+          const pct = cap ? Math.min(100, Math.round(used * 100 / cap)) : 0;
+          const out = cap != null && left === 0;
+          return (
+            <div className="card coupon-card" key={c.id}>
+              <div className="ac-id">
+                <b className="mono">{c.code}</b>
+                <span className="chip chip-leaf">折 NT${Number(c.discount_twd)}</span>
+                {!c.is_active && <span className="off-tag">停用</span>}
+                {out && <span className="off-tag">名額已滿</span>}
+              </div>
+              <div className="small">{c.label || "—"}</div>
+              <div className="coupon-bar-row">
+                <div className="coupon-bar">{cap != null && <i style={{ width: pct + "%" }} />}</div>
+                <div className="coupon-bar-text">
+                  {cap == null ? <>已用 <b>{used}</b> 張 · 不限量</> : <>已用 <b>{used}</b> / {cap} 張 · 剩 <b>{left}</b> 張</>}
+                </div>
+              </div>
+              <div className="ac-actions">
+                <button className="btn tiny" onClick={() => updateLimit(c)}>調整發放總量</button>
+                <button className="btn tiny" onClick={() => toggle(c)}>{c.is_active ? "停用" : "啟用"}</button>
+                <button className="btn tiny danger" onClick={() => del(c)}>刪除</button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <div className="hint">建議：行銷活動發放時，先設一個合理的「發放總量」，把券碼分享到 Facebook／LINE 社群。同一張券每位用戶限用 1 次；發完即停。</div>
+    </div>
+  );
+}
+
+/* ===================== 會員管理 ===================== */
+function MembersPage({ session, flash, initialSort }) {
+  const { token } = session;
+  const [list, setList] = useState(null);
+  const [q, setQ] = useState("");
+  const [range, setRange] = useState(initialSort === "today"
+    ? { start: today(), end: today() }
+    : { start: monthStart(), end: today() });
+  const [useRange, setUseRange] = useState(initialSort === "today");
+  const [detailId, setDetailId] = useState(null);
+
+  const load = async () => {
+    try {
+      const base = "select=id,username,country,country_code,phone,credit_balance,points,invite_code,is_active,created_at,referred_by_salesperson_id&order=created_at.desc&limit=500";
+      let filters = [];
+      if (useRange) {
+        const s = new Date(range.start); s.setHours(0,0,0,0);
+        const e = new Date(range.end); e.setHours(23,59,59,999);
+        filters.push(`created_at=gte.${encodeURIComponent(s.toISOString())}`);
+        filters.push(`created_at=lte.${encodeURIComponent(e.toISOString())}`);
+      }
+      if (q.trim()) filters.push(`or=(username.ilike.${encodeURIComponent(`%${q.trim()}%`)},phone.ilike.${encodeURIComponent(`%${q.trim()}%`)},invite_code.ilike.${encodeURIComponent(`%${q.trim()}%`)})`);
+      const path = `app_users?${filters.join("&")}&${base}`;
+      setList(await rest(path, { token }));
+    } catch (e) { flash(e.message); }
+  };
+  useEffect(() => { load(); }, [range, useRange]);
+
+  if (detailId) return <MemberDetail token={token} userId={detailId} onBack={() => setDetailId(null)} flash={flash} />;
+
+  // 小計統計
+  const totalCredit = list ? list.reduce((s, u) => s + Number(u.credit_balance || 0), 0) : 0;
+  const spUsers = list ? list.filter(u => u.referred_by_salesperson_id).length : 0;
+
+  return (
+    <div>
+      <div className="page-h-row">
+        <h2 className="page-t">會員管理</h2>
+        {list && <div className="hint">找到 <b>{list.length}</b> 位會員</div>}
+      </div>
+
+      {/* 篩選 */}
+      <div className="stats-filters">
+        <label className="switch" style={{marginBottom:0}}>
+          <input type="checkbox" checked={useRange} onChange={e => setUseRange(e.target.checked)} />
+          <span>按註冊時間篩選</span>
+        </label>
+        {useRange && <DateRangePicker value={range} onChange={setRange} />}
+        <div className="coupon-row" style={{flex:1,marginBottom:0}}>
+          <input className="mono" placeholder="搜尋用戶名、手機號或邀請碼" value={q}
+            onChange={e => setQ(e.target.value)} onKeyDown={e => e.key === "Enter" && load()} />
+          <button className="btn primary" onClick={load}>搜尋</button>
+        </div>
+      </div>
+
+      {/* 小計卡片 */}
+      {list && useRange && (
+        <div className="kpi-grid" style={{marginBottom:12}}>
+          <KpiCard label="期間新增會員" value={list.length} highlight />
+          <KpiCard label="業務員帶來" value={spUsers} sub={`佔比 ${list.length ? Math.round(spUsers/list.length*100) : 0}%`} />
+          <KpiCard label="自然流量" value={list.length - spUsers} />
+          <KpiCard label="總運費額度" value={`NT$${totalCredit}`} />
+        </div>
+      )}
+
+      {!list ? <div className="muted">載入中…</div> : list.length === 0 ? <div className="empty big">沒有符合的會員</div> : (
+        <div className="admin-list">
+          {list.map((u) => (
+            <div className="card member-row" key={u.id}>
+              <div className="m-main">
+                <div className="ac-id">
+                  <b>{u.username}</b>
+                  {!u.is_active && <span className="off-tag">已停用</span>}
+                  <span className="role-badge r-warehouse">{u.country}</span>
+                  {u.referred_by_salesperson_id && <span className="chip chip-sea" style={{fontSize:10}}>業務員</span>}
+                </div>
+                <div className="small mono">{u.country_code.replace("-CA","")} {u.phone}</div>
+                <div className="m-meta">
+                  <span>註冊 {new Date(u.created_at).toLocaleString("zh-TW")}</span>
+                  <span>邀請碼 <b className="mono">{u.invite_code}</b></span>
+                  <span>額度 NT${u.credit_balance}</span>
+                  <span>積分 {u.points}</span>
+                </div>
+              </div>
+              <button className="btn primary" onClick={() => setDetailId(u.id)}>查看詳情</button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// 會員詳情中的業務員指派區塊
+function SalespersonAssignBox({ userId, currentSpId, token, flash, onChange }) {
+  const [spList, setSpList] = useState(null);
+  const [selected, setSelected] = useState(currentSpId || "");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    rest("salespersons?select=id,name,promo_code,is_active&order=name.asc", { token })
+      .then(rows => setSpList((rows || []).filter(s => s.is_active)))
+      .catch(() => setSpList([]));
+  }, []);
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      await spAdminCall("assignUser", { user_id: userId, salesperson_id: selected || null }, token);
+      flash(selected ? "已指派業務員" : "已移除業務員歸屬");
+      onChange && onChange();
+    } catch (e) { flash(e.message); }
+    setBusy(false);
+  };
+
+  const changed = selected !== (currentSpId || "");
+  if (!spList) return null;
+
+  return (
+    <div className="assign-sp-box">
+      <div className="assign-sp-label">業務員歸屬</div>
+      <div className="assign-sp-row">
+        <select
+          className="assign-sp-select"
+          value={selected}
+          onChange={e => setSelected(e.target.value)}
+        >
+          <option value="">— 無業務員（自然流量）—</option>
+          {spList.map(sp => (
+            <option key={sp.id} value={sp.id}>{sp.name}（{sp.promo_code}）</option>
+          ))}
+        </select>
+        {changed && (
+          <button className="btn primary" disabled={busy} onClick={save}>
+            {busy ? "儲存中…" : "確認"}
+          </button>
+        )}
+      </div>
+      <div className="hint sm">指派後，客戶下次登入將使用該業務員的費率和客服聯繫方式。</div>
+    </div>
+  );
+}
+
+function MemberDetail({ token, userId, onBack, flash }) {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState("");
+  const [tab, setTab] = useState("overview");
+  const load = async () => {
+    try {
+      const r = await fetch(`${SUPA_URL}/rest/v1/rpc/admin_user_detail`, { method: "POST", headers: { apikey: ANON, Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ uid: userId }) });
+      const d = await r.json(); if (!r.ok) throw new Error(d.message || "讀取失敗");
+      setData(d);
+    } catch (e) { setErr(e.message); }
+  };
+  useEffect(() => { load(); }, [userId]);
+  if (err) return <div><button className="btn" onClick={onBack}>‹ 返回會員列表</button><div className="err">{err}</div></div>;
+  if (!data) return <div><button className="btn" onClick={onBack}>‹ 返回會員列表</button><div className="muted">載入中…</div></div>;
+  const u = data.user;
+  const st = data.stats;
+  const pkgs = data.packages || [];
+  const ships = data.shipments || [];
+  const addrs = data.addresses || [];
+  const invitees = data.invitees || [];
+  const ledger = data.points_ledger || [];
+  const earned = Number(data.points_earned_total || 0);
+  const used = Number(data.points_used_total || 0);
+  const inProgress = ships.filter((s) => s.status !== "shipped" && s.status !== "completed" && s.status !== "cancelled");
+  const done = ships.filter((s) => s.status === "shipped" || s.status === "completed");
+  const PKG_LBL = { pending: "待到倉", arrived: "已到倉", abnormal: "異常", packed: "已打包", shipped: "已出貨" };
+  const PKG_CHIP = { pending: "chip-grey", arrived: "chip-sea", abnormal: "chip-alert", packed: "chip-leaf", shipped: "chip-leaf" };
+  const SHIP_LBL = { awaiting_payment: "待付款", payment_review: "待確認", packing: "打包中", shipped: "已出貨", completed: "已完成", cancelled: "已取消" };
+  const REASON_LBL = { referral: "邀請好友獎勵", redeem: "下單折抵", manual: "手動調整" };
+
+  return (
+    <div>
+      <div className="page-head">
+        <button className="btn" onClick={onBack}>‹ 返回</button>
+        <h2 className="page-t" style={{margin:0}}>{u.username} 的會員詳情</h2>
+      </div>
+
+      <div className="card member-summary">
+        <div className="ms-head">
+          <div className="avatar lg">{(u.username || "?").slice(0, 1)}</div>
+          <div className="ms-info">
+            <div className="ms-name"><b>{u.username}</b>{!u.is_active && <span className="off-tag">已停用</span>}</div>
+            <div className="small mono">{u.country_code.replace("-CA","")} {u.phone} · {u.country}</div>
+            <div className="small">註冊時間 {new Date(u.created_at).toLocaleString("zh-TW")} · 邀請碼 <b className="mono">{u.invite_code}</b></div>
+          </div>
+        </div>
+        <div className="ov-grid member-stats">
+          <div className="ov-card"><span>運費額度</span><b>NT${u.credit_balance}</b><i>已用 {u.credit_used}/20</i></div>
+          <div className="ov-card gold"><span>目前積分</span><b>{u.points}</b><i>累計賺 {earned} · 已用 {used}</i></div>
+          <div className="ov-card sea"><span>已邀請好友</span><b>{data.referrals_count}</b><i>位</i></div>
+          <div className="ov-card leaf"><span>已完成訂單</span><b>{st.orders_done}</b><i>進行中 {st.orders_in_progress}</i></div>
+          <div className="ov-card"><span>累計消費 RMB</span><b>¥{Number(st.spent_rmb).toFixed(2)}</b><i>宅配</i></div>
+          <div className="ov-card"><span>累計消費 TWD</span><b>NT${Number(st.spent_twd).toFixed(2)}</b><i>7-11</i></div>
+        </div>
+        <SalespersonAssignBox userId={u.id} currentSpId={u.referred_by_salesperson_id} token={token} flash={flash} onChange={load} />
+      </div>
+
+      <div className="subtabs">
+        <button className={"subtab " + (tab === "overview" ? "on" : "")} onClick={() => setTab("overview")}>包裹明細（{pkgs.length}）</button>
+        <button className={"subtab " + (tab === "inprogress" ? "on" : "")} onClick={() => setTab("inprogress")}>進行中訂單（{inProgress.length}）</button>
+        <button className={"subtab " + (tab === "done" ? "on" : "")} onClick={() => setTab("done")}>已完成訂單（{done.length}）</button>
+        <button className={"subtab " + (tab === "invitees" ? "on" : "")} onClick={() => setTab("invitees")}>邀請好友（{invitees.length}）</button>
+        <button className={"subtab " + (tab === "points" ? "on" : "")} onClick={() => setTab("points")}>積分明細（{ledger.length}）</button>
+        <button className={"subtab " + (tab === "addr" ? "on" : "")} onClick={() => setTab("addr")}>收件資訊（{addrs.length}）</button>
+      </div>
+
+      {tab === "overview" && (
+        pkgs.length === 0 ? <div className="empty big">尚無包裹</div> : (
+          <div className="admin-list">
+            {pkgs.map((p) => (
+              <div className="card" key={p.id}>
+                <div className="ac-id">
+                  <b>{p.product_name || "（未命名）"}</b>
+                  <span className={"chip " + PKG_CHIP[p.status]}>{PKG_LBL[p.status] || p.status}</span>
+                  {p.shelf_code && <span className="shelf">貨架 {p.shelf_code}</span>}
+                </div>
+                <div className="small mono">{p.tracking_no}</div>
+                <div className="small">錄入 {new Date(p.created_at).toLocaleString("zh-TW")}{p.arrived_at && ` · 到倉 ${new Date(p.arrived_at).toLocaleString("zh-TW")}`}{p.weight != null && ` · ${p.weight}kg`}</div>
+                {p.photo_url && <img className="abn-photo" src={p.photo_url} alt="包裹" />}
+              </div>
+            ))}
+          </div>
+        )
+      )}
+
+      {(tab === "inprogress" || tab === "done") && (() => {
+        const arr = tab === "inprogress" ? inProgress : done;
+        if (arr.length === 0) return <div className="empty big">沒有符合的訂單</div>;
+        return (
+          <div className="admin-list">
+            {arr.map((s) => (
+              <div className="card order" key={s.id}>
+                <div className="order-h"><span className="mono">{s.order_no}</span><span className="chip chip-grey">{SHIP_LBL[s.status] || s.status}</span></div>
+                <div className="small">{new Date(s.created_at).toLocaleString("zh-TW")} · {s.delivery_type === "home" ? "宅配到府" : "7-11 取貨"} · {s.total_weight}kg</div>
+                {s.recipient_snapshot && (
+                  <div className="recipient-snap">
+                    <b>收件資訊</b>
+                    {s.delivery_type === "home"
+                      ? <div className="small">{s.recipient_snapshot.receiver_name} · {s.recipient_snapshot.phone}<br />{s.recipient_snapshot.detail}</div>
+                      : <div className="small">7-11 {s.recipient_snapshot.store_name}門市<br />取貨人 {s.recipient_snapshot.receiver_name} · {s.recipient_snapshot.phone}<br />{s.recipient_snapshot.store_addr}</div>}
+                  </div>
+                )}
+                <div className="order-pay"><span>金額</span><b className="mono">{s.currency === "TWD" ? "NT$" : "¥"}{s.freight_amount}</b></div>
+                {s.return_tracking_no && <div className="small mono">{s.return_carrier || (s.delivery_type==="711"?"7-ELEVEN":"新竹物流")} · {s.return_tracking_no}</div>}
+                {s.shipped_at && <div className="small">出貨 {new Date(s.shipped_at).toLocaleString("zh-TW")}</div>}
+              </div>
+            ))}
+          </div>
+        );
+      })()}
+
+      {tab === "invitees" && (
+        invitees.length === 0
+          ? <div className="empty big">尚未邀請任何好友</div>
+          : (
+            <>
+              <div className="ord-sum">共邀請 <b>{invitees.length}</b> 位好友 · 累計獲得邀請積分 <b>{invitees.reduce((s, x) => s + Number(x.points_awarded || 0), 0)}</b> 分</div>
+              <div className="admin-list">
+                {invitees.map((x) => (
+                  <div className="card invitee-row" key={x.id}>
+                    <div className="avatar">{(x.username || "?").slice(0, 1)}</div>
+                    <div className="m-main">
+                      <div className="ac-id"><b>{x.username}</b><span className="role-badge r-warehouse">{x.country}</span></div>
+                      <div className="small mono">{x.country_code?.replace("-CA", "")} {x.phone}</div>
+                      <div className="m-meta">
+                        <span>註冊 {new Date(x.created_at).toLocaleString("zh-TW")}</span>
+                        <span>已完成訂單 <b>{x.orders_done}</b></span>
+                      </div>
+                    </div>
+                    <div className="invitee-pts">+{x.points_awarded || 0} <i>積分</i></div>
+                  </div>
+                ))}
+              </div>
+            </>
+          )
+      )}
+
+      {tab === "points" && (
+        ledger.length === 0
+          ? <div className="empty big">尚無積分紀錄</div>
+          : (
+            <>
+              <div className="ord-sum">累計獲得 <b>{earned}</b> 分 · 累計使用 <b>{used}</b> 分 · 目前餘額 <b>{u.points}</b> 分</div>
+              <div className="admin-list">
+                {ledger.map((l) => {
+                  const isIn = l.delta > 0;
+                  const reasonLabel = REASON_LBL[l.reason] || l.reason;
+                  const detail = l.reason === "referral" && l.invitee_name
+                    ? `邀請 ${l.invitee_name} 註冊`
+                    : l.reason === "redeem" && l.order_no
+                      ? `用於訂單 ${l.order_no}`
+                      : "";
+                  return (
+                    <div className="card pt-row" key={l.id}>
+                      <div className="m-main">
+                        <div className="ac-id">
+                          <b>{reasonLabel}</b>
+                          <span className={"chip " + (isIn ? "chip-leaf" : "chip-alert")}>{isIn ? "獲得" : "使用"}</span>
+                        </div>
+                        {detail && <div className="small">{detail}</div>}
+                        <div className="small">{new Date(l.created_at).toLocaleString("zh-TW")}</div>
+                      </div>
+                      <div className={"pt-delta " + (isIn ? "in" : "out")}>{isIn ? "+" : ""}{l.delta}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          )
+      )}
+
+      {tab === "addr" && (
+        addrs.length === 0 ? <div className="empty big">尚未設定收件資訊</div> : (
+          <div className="admin-list">
+            {addrs.map((a) => (
+              <div className="card" key={a.id}>
+                <div className="ac-id">
+                  <span className={"chip " + (a.type === "home" ? "chip-sea" : "chip-leaf")}>{a.type === "home" ? "宅配" : "7-11 取貨"}</span>
+                </div>
+                {a.type === "home"
+                  ? <div className="small"><b>{a.receiver_name} · {a.phone}</b><br />{a.detail}</div>
+                  : <div className="small"><b>{a.store_name} 門市</b><br />取貨人 {a.receiver_name} · {a.phone}<br />{a.store_addr} · 店號 {a.store_id}</div>}
+              </div>
+            ))}
+          </div>
+        )
+      )}
+    </div>
+  );
+}
+
+/* ===================== 管理員帳號 ===================== */
+function AdminsPage({ session, flash }) {
+  const { token, me } = session;
+  const [admins, setAdmins] = useState(null); const [catalog, setCatalog] = useState([]); const [templates, setTemplates] = useState({});
+  const [creating, setCreating] = useState(false); const [editId, setEditId] = useState(null); const [err, setErr] = useState("");
+  const load = async () => {
+    try {
+      const [a, c, t] = await Promise.all([
+        rest("admins?select=*&order=created_at.asc", { token }),
+        rest("permission_catalog?select=*&order=sort.asc", { token }),
+        rest("role_templates?select=*", { token }),
+      ]);
+      setAdmins(a); setCatalog(c); setTemplates(Object.fromEntries(t.map((x) => [x.role, x.permissions])));
+    } catch (e) { setErr(e.message); }
+  };
+  useEffect(() => { load(); }, []);
+  const groups = catalog.reduce((m, p) => ((m[p.group_label] = m[p.group_label] || []).push(p), m), {});
+  if (err) return <div className="err">{err}</div>;
+  if (!admins) return <div className="muted">載入中…</div>;
+  return (
+    <div>
+      <div className="page-head"><h2 className="page-t">管理員帳號</h2><button className="btn primary" onClick={() => { setCreating(true); setEditId(null); }}>＋ 新增管理員</button></div>
+      {creating && <AdminForm mode="create" me={me} groups={groups} catalog={catalog} templates={templates} onCancel={() => setCreating(false)} onSave={async (p) => { await fn("create", p, token); flash("已新增管理員"); setCreating(false); load(); }} />}
+      <div className="admin-list">
+        {admins.map((a) => <AdminRow key={a.id} a={a} me={me} token={token} groups={groups} catalog={catalog} templates={templates} expanded={editId === a.id} onToggle={() => setEditId(editId === a.id ? null : a.id)} flash={flash} reload={load} />)}
+      </div>
+    </div>
+  );
+}
+function AdminRow({ a, me, token, groups, catalog, templates, expanded, onToggle, flash, reload }) {
+  const isSelf = a.id === me.id;
+  const setActive = async (val) => { try { await rest(`admins?id=eq.${a.id}`, { token, method: "PATCH", body: { is_active: val }, prefer: "return=minimal" }); flash(val ? "已啟用" : "已停用"); reload(); } catch (e) { flash(e.message); } };
+  const resetPw = async () => { const np = prompt(`為「${a.display_name || a.email}」設定新密碼（至少 6 碼）`); if (!np) return; try { await fn("resetPassword", { id: a.id, password: np }, token); flash("密碼已重設"); } catch (e) { flash(e.message); } };
+  return (
+    <div className={"admin-card " + (a.is_active ? "" : "off")}>
+      <div className="ac-head"><div className="ac-id"><b>{a.display_name || a.username}</b><span className={"role-badge r-" + a.role}>{ROLE_LABEL[a.role] || a.role}</span>{a.is_super && <span className="role-badge r-super">全部權限</span>}{isSelf && <span className="self-tag">目前登入</span>}{!a.is_active && <span className="off-tag">已停用</span>}</div><div className="ac-email mono">{a.email}</div></div>
+      <div className="ac-actions">
+        <button className="btn tiny" onClick={onToggle}>{expanded ? "收合" : "編輯權限"}</button>
+        <button className="btn tiny" onClick={resetPw}>重設密碼</button>
+        {!isSelf && (a.is_active ? <button className="btn tiny danger" onClick={() => setActive(false)}>停用</button> : <button className="btn tiny" onClick={() => setActive(true)}>啟用</button>)}
+      </div>
+      {expanded && <AdminForm mode="edit" a={a} me={me} groups={groups} catalog={catalog} templates={templates} onCancel={onToggle} onSave={async (p) => { await rest(`admins?id=eq.${a.id}`, { token, method: "PATCH", prefer: "return=minimal", body: { role: p.role, is_super: p.role === "super", permissions: p.permissions } }); flash("已更新權限"); onToggle(); reload(); }} />}
+    </div>
+  );
+}
+function AdminForm({ mode, a, me, groups, catalog, templates, onSave, onCancel }) {
+  const [display_name, setName] = useState(a?.display_name || "");
+  const [email, setEmail] = useState(a?.email || ""); const [password, setPw] = useState("");
+  const [role, setRole] = useState(a?.role || "warehouse");
+  const [perms, setPerms] = useState(a?.permissions || templates["warehouse"] || []);
+  const [busy, setBusy] = useState(false); const [err, setErr] = useState("");
+  const allKeys = catalog.map((c) => c.key);
+  const applyRole = (r) => { setRole(r); if (r === "super") setPerms(allKeys); else if (templates[r]) setPerms(templates[r]); };
+  const toggle = (k) => setPerms((p) => p.includes(k) ? p.filter((x) => x !== k) : [...p, k]);
+  const lockedSelf = mode === "edit" && a?.id === me.id;
+  const save = async () => {
+    setErr(""); setBusy(true);
+    try {
+      if (mode === "create") { if (!email.trim() || password.length < 6) throw new Error("請填 Email，密碼至少 6 碼"); await onSave({ email: email.trim(), password, display_name, role, permissions: role === "super" ? allKeys : perms }); }
+      else { await onSave({ role, permissions: role === "super" ? allKeys : perms }); }
+    } catch (e) { setErr(e.message); setBusy(false); }
+  };
+  return (
+    <div className="form-box">
+      {mode === "create" && <div className="form-grid"><label className="fld"><span>顯示名稱</span><input value={display_name} onChange={(e) => setName(e.target.value)} placeholder="例：陳小姐" /></label><label className="fld"><span>登入 Email</span><input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="staff@example.com" /></label><label className="fld"><span>初始密碼</span><input value={password} onChange={(e) => setPw(e.target.value)} placeholder="至少 6 碼" /></label></div>}
+      <div className="role-pick"><span className="fld-label">角色範本</span>{["warehouse", "finance", "super", "custom"].map((r) => <button key={r} disabled={lockedSelf} className={"chip-btn " + (role === r ? "on" : "")} onClick={() => applyRole(r)}>{ROLE_LABEL[r]}</button>)}</div>
+      {lockedSelf && <div className="warn">為避免把自己鎖在門外，無法編輯目前登入帳號的權限。</div>}
+      <div className={"perm-groups " + (role === "super" || lockedSelf ? "dim" : "")}>
+        {Object.entries(groups).map(([g, items]) => <div className="perm-group" key={g}><div className="perm-g-title">{g}</div>{items.map((p) => <label className="perm-row" key={p.key}><input type="checkbox" disabled={role === "super" || lockedSelf} checked={role === "super" || perms.includes(p.key)} onChange={() => toggle(p.key)} /><span>{p.label}</span></label>)}</div>)}
+      </div>
+      {role === "super" && <div className="muted sm">超級管理員自動擁有全部權限。</div>}
+      {err && <div className="err">{err}</div>}
+      <div className="form-actions"><button className="btn ghost" onClick={onCancel}>取消</button><button className="btn primary" disabled={busy || lockedSelf} onClick={save}>{busy ? "儲存中…" : mode === "create" ? "建立帳號" : "儲存權限"}</button></div>
+    </div>
+  );
+}
+
+/* ===================== 預設客服面板 ===================== */
+function DefaultContactPanel({ session, flash }) {
+  const { token } = session;
+  const [s, setS] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const load = async () => {
+    try {
+      const r = await rest("settings?id=eq.1&select=default_wechat,default_wechat_qr_url,default_line_id,default_whatsapp", { token });
+      setS(r[0] || {});
+    } catch (e) { flash(e.message); }
+  };
+  useEffect(() => { load(); }, []);
+  if (!s) return <div className="muted">載入中…</div>;
+  const upd = (k, v) => setS({ ...s, [k]: v });
+  const save = async () => {
+    setBusy(true);
+    try {
+      await ops("updateSettings", {
+        default_wechat: s.default_wechat || "",
+        default_wechat_qr_url: s.default_wechat_qr_url || "",
+        default_line_id: s.default_line_id || "",
+        default_whatsapp: s.default_whatsapp || "",
+      }, token);
+      flash("已儲存預設客服資訊"); load();
+    } catch (e) { flash(e.message); }
+    setBusy(false);
+  };
+  return (
+    <div className="card">
+      <div className="hint" style={{ marginBottom: 14, lineHeight: 1.7 }}>
+        這裡設定的客服聯繫方式會顯示給<b>沒有業務員歸屬</b>的客戶（自然流量、舊用戶）。<br />
+        透過業務員推廣連結註冊的客戶，會優先看到所屬業務員的聯繫方式。
+      </div>
+      <label className="fld"><span>客服微信號</span>
+        <input className="mono" value={s.default_wechat || ""} onChange={(e) => upd("default_wechat", e.target.value)} placeholder="例：yunqiao_kf" />
+      </label>
+      <label className="fld"><span>客服微信二維碼 URL（選填）</span>
+        <input className="mono" value={s.default_wechat_qr_url || ""} onChange={(e) => upd("default_wechat_qr_url", e.target.value)} placeholder="https://..." />
+        <div className="hint" style={{ marginTop: 4 }}>建議上傳到圖片空間後填寫 URL，用戶端會顯示為二維碼。</div>
+      </label>
+      <label className="fld"><span>客服 LINE ID</span>
+        <input className="mono" value={s.default_line_id || ""} onChange={(e) => upd("default_line_id", e.target.value)} placeholder="例：yunqiao（不要加 @）" />
+      </label>
+      <label className="fld"><span>客服 WhatsApp 號碼</span>
+        <input className="mono" value={s.default_whatsapp || ""} onChange={(e) => upd("default_whatsapp", e.target.value)} placeholder="例：+8613800138000（含國碼）" />
+      </label>
+      <button className="btn primary block" disabled={busy} onClick={save}>{busy ? "儲存中…" : "儲存預設客服"}</button>
+    </div>
+  );
+}
+
+/* ===================== 業務員管理頁 ===================== */
+async function spAdminCall(action, payload, token) {
+  const r = await fetch(`${SUPA_URL}/functions/v1/salesperson-admin`, {
+    method: "POST",
+    headers: { apikey: ANON, Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ action, ...payload }),
+  });
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.error || "操作失敗");
+  return d;
+}
+
+function SalespersonsPage({ session, has, flash }) {
+  const { token } = session;
+  const canManage = has("salespersons.manage");
+  const [items, setItems] = useState([]);
+  const [editing, setEditing] = useState(null);  // {} = 新增、obj = 編輯
+  const [viewDetail, setViewDetail] = useState(null);  // 查看詳情
+  const [busy, setBusy] = useState(false);
+
+  const load = async () => {
+    try {
+      const r = await spAdminCall("list", {}, token);
+      setItems(r.items || []);
+    } catch (e) { flash(e.message); }
+  };
+  useEffect(() => { load(); }, []);
+
+  const remove = async (sp) => {
+    if (!confirm(`確定刪除業務員「${sp.name}」？\n注意：他名下客戶將失去業務員歸屬，但客戶帳號與訂單不會被刪除。`)) return;
+    try { await spAdminCall("delete", { id: sp.id }, token); flash("已刪除"); load(); }
+    catch (e) { flash(e.message); }
+  };
+
+  const baseUrl = typeof window !== "undefined" ? `${window.location.protocol}//${window.location.host.replace("admin.", "").replace("yunqiaoguoji-admin", "yunqiaoguoji-user")}` : "https://yunqiaoguoji.com";
+
+  if (viewDetail) return <SalespersonDetail token={token} sp={viewDetail} onBack={() => setViewDetail(null)} flash={flash} />;
+
+  if (editing) return (
+    <SalespersonForm
+      sp={editing.id ? editing : null}
+      token={token}
+      onCancel={() => setEditing(null)}
+      onSave={async () => { setEditing(null); await load(); flash(editing.id ? "已更新" : "已新增業務員"); }}
+      flash={flash}
+    />
+  );
+
+  return (
+    <div>
+      <div className="page-h-row">
+        <h2 className="page-t">業務員管理</h2>
+        {canManage && <button className="btn primary" onClick={() => setEditing({})}>＋ 新增業務員</button>}
+      </div>
+
+      {/* 業務員管理總覽 KPI */}
+      {items.length > 0 && (() => {
+        const activeItems = items.filter(s => s.is_active);
+        const totalCustomers = items.reduce((s, x) => s + (x.total_customers || 0), 0);
+        const totalOrders = items.reduce((s, x) => s + (x.total_orders || 0), 0);
+        const pendingCom = items.reduce((s, x) => s + Number(x.total_commission_twd || 0), 0);
+        // 本月新客估算（從列表總計，精確數據需 RPC）
+        return (
+          <div className="kpi-grid" style={{marginBottom:16}}>
+            <KpiCard label="業務員總數" value={items.length} sub={`啟用中 ${activeItems.length}`} highlight />
+            <KpiCard label="業務員累計客戶" value={totalCustomers} />
+            <KpiCard label="業務員累計訂單" value={totalOrders} />
+            <KpiCard label="累計結算佣金" value={`NT$${Math.round(pendingCom)}`} highlight />
+          </div>
+        );
+      })()}
+
+      <div className="hint" style={{ marginBottom: 14 }}>共 {items.length} 位業務員。點擊業務員姓名查看詳細業績、客戶名單、訂單。</div>
+      {items.length === 0 && <div className="empty">尚未新增業務員。點右上「＋ 新增業務員」開始。</div>}
+      <div className="sp-grid">
+        {items.map((sp) => (
+          <div className={"sp-card " + (sp.is_active ? "" : "disabled")} key={sp.id}>
+            <div className="sp-card-h">
+              <div>
+                <div className="sp-name" onClick={() => setViewDetail(sp)}>
+                  {sp.name}
+                  {!sp.is_active && <span className="sp-tag-off">已停用</span>}
+                </div>
+                <div className="sp-user mono">{sp.login_username}</div>
+              </div>
+              {canManage && (
+                <div className="sp-card-actions">
+                  <button className="btn ghost tiny" onClick={() => setEditing(sp)}>編輯</button>
+                  <button className="btn danger tiny" onClick={() => remove(sp)}>刪除</button>
+                </div>
+              )}
+            </div>
+            <div className="sp-stats">
+              <div className="sp-stat"><b>{sp.total_customers || 0}</b><span>客戶</span></div>
+              <div className="sp-stat"><b>{sp.total_orders || 0}</b><span>訂單</span></div>
+              <div className="sp-stat"><b>{Number(sp.commission_rate || 0)}%</b><span>佣金率</span></div>
+            </div>
+            <div className="sp-promo">
+              <span className="muted sm">推廣連結：</span>
+              <div className="sp-promo-url" onClick={() => { try { navigator.clipboard?.writeText(`${baseUrl}/?ref=${sp.promo_code}`); flash("已複製推廣連結"); } catch(e){} }}>
+                <span className="mono">{`${baseUrl}/?ref=${sp.promo_code}`}</span>
+                <button className="btn tiny">複製</button>
+              </div>
+            </div>
+            {sp.use_custom_rates && <div className="sp-rate-badge">⚙ 已啟用自訂費率</div>}
+            <div className="sp-contacts sm">
+              {sp.wechat && <span>💚 {sp.wechat}</span>}
+              {sp.line_id && <span>💬 {sp.line_id}</span>}
+              {sp.whatsapp && <span>📱 {sp.whatsapp}</span>}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function SalespersonForm({ sp, token, onCancel, onSave, flash }) {
+  const [f, setF] = useState({
+    name: sp?.name || "",
+    login_username: sp?.login_username || "",
+    login_password: "",
+    promo_code: sp?.promo_code || "",
+    wechat: sp?.wechat || "",
+    wechat_qr_url: sp?.wechat_qr_url || "",
+    line_id: sp?.line_id || "",
+    whatsapp: sp?.whatsapp || "",
+    commission_rate: sp?.commission_rate ?? 5,
+    use_custom_rates: !!sp?.use_custom_rates,
+    custom_price_per_kg: sp?.custom_price_per_kg ?? "",
+    custom_rate_rmb: sp?.custom_rate_rmb ?? "",
+    custom_rate_twd: sp?.custom_rate_twd ?? "",
+    custom_fee_home: sp?.custom_fee_home ?? "",
+    custom_fee_711: sp?.custom_fee_711 ?? "",
+    is_active: sp?.is_active !== false,
+    notes: sp?.notes || "",
+  });
+  const [platform, setPlatform] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  useEffect(() => {
+    rest("settings?id=eq.1&select=price_per_kg,rate_rmb,rate_twd,fee_home,fee_711", { token })
+      .then(r => setPlatform(r[0] || null)).catch(() => {});
+  }, []);
+  const upd = (k, v) => setF({ ...f, [k]: v });
+
+  const save = async () => {
+    setErr(""); setBusy(true);
+    try {
+      if (!f.name.trim()) throw new Error("請填寫業務員姓名");
+      if (!sp && !f.login_username.trim()) throw new Error("請填寫登入帳號");
+      if (!sp && (!f.login_password || f.login_password.length < 6)) throw new Error("密碼至少 6 碼");
+      const payload = { ...f };
+      if (sp) payload.id = sp.id;
+      ["custom_price_per_kg","custom_rate_rmb","custom_rate_twd","custom_fee_home","custom_fee_711","commission_rate"]
+        .forEach(k => { payload[k] = payload[k] === "" ? null : Number(payload[k]); });
+      await spAdminCall(sp ? "update" : "create", payload, token);
+      onSave();
+    } catch (e) { setErr(e.message); }
+    setBusy(false);
+  };
+
+  const platformHint = (key, label) => platform ? <div className="hint sm">平台價：{platform[key]}（不得低於此價）</div> : null;
+
+  return (
+    <div>
+      <div className="page-h-row">
+        <h2 className="page-t">{sp ? `編輯業務員 - ${sp.name}` : "新增業務員"}</h2>
+        <button className="btn ghost" onClick={onCancel}>← 返回</button>
+      </div>
+
+      <div className="card">
+        <h3 className="sec">基本資料</h3>
+        <div className="form-grid">
+          <label className="fld"><span>姓名 *</span><input value={f.name} onChange={(e) => upd("name", e.target.value)} /></label>
+          <label className="fld"><span>登入帳號 *</span>
+            <input className="mono" value={f.login_username} disabled={!!sp} onChange={(e) => upd("login_username", e.target.value.toLowerCase().replace(/[^a-z0-9_-]/g, ""))} />
+            {sp && <div className="hint sm">建立後不可修改</div>}
+          </label>
+          <label className="fld"><span>{sp ? "新密碼（留空表示不更改）" : "登入密碼 *"}</span>
+            <input type="password" value={f.login_password} onChange={(e) => upd("login_password", e.target.value)} placeholder={sp ? "留空不變" : "至少 6 碼"} />
+          </label>
+          <label className="fld"><span>推廣碼</span>
+            <input className="mono" value={f.promo_code} disabled={!!sp} onChange={(e) => upd("promo_code", e.target.value.toLowerCase().replace(/[^a-z0-9_-]/g, ""))} placeholder="預設用登入帳號" />
+          </label>
+        </div>
+        {sp && (
+          <label className="fld" style={{ marginTop: 8 }}>
+            <span>狀態</span>
+            <div className="switch-row">
+              <label className="switch"><input type="checkbox" checked={f.is_active} onChange={(e) => upd("is_active", e.target.checked)} /><span>啟用此業務員</span></label>
+            </div>
+          </label>
+        )}
+      </div>
+
+      <div className="card">
+        <h3 className="sec">聯繫方式（用戶看到的客服資訊）</h3>
+        <div className="form-grid">
+          <label className="fld"><span>微信號</span><input className="mono" value={f.wechat} onChange={(e) => upd("wechat", e.target.value)} placeholder="例：salesman001" /></label>
+          <label className="fld"><span>微信二維碼 URL（選填）</span><input className="mono" value={f.wechat_qr_url} onChange={(e) => upd("wechat_qr_url", e.target.value)} placeholder="https://..." /></label>
+          <label className="fld"><span>LINE ID</span><input className="mono" value={f.line_id} onChange={(e) => upd("line_id", e.target.value)} placeholder="不要加 @" /></label>
+          <label className="fld"><span>WhatsApp 號碼</span><input className="mono" value={f.whatsapp} onChange={(e) => upd("whatsapp", e.target.value)} placeholder="+886912345678" /></label>
+        </div>
+      </div>
+
+      <div className="card">
+        <h3 className="sec">佣金與費率</h3>
+        <label className="fld"><span>佣金比例（%）</span>
+          <input type="number" step="0.1" min="0" max="100" value={f.commission_rate} onChange={(e) => upd("commission_rate", e.target.value)} />
+          <div className="hint sm">按訂單金額（換算 TWD）的此比例計算佣金</div>
+        </label>
+        <label className="switch" style={{ marginTop: 10 }}>
+          <input type="checkbox" checked={f.use_custom_rates} onChange={(e) => upd("use_custom_rates", e.target.checked)} />
+          <span>啟用業務員自訂費率（不啟用則使用平台統一價）</span>
+        </label>
+        {f.use_custom_rates && (
+          <div className="form-grid" style={{ marginTop: 12 }}>
+            <label className="fld"><span>每公斤運費（RMB）</span>
+              <input type="number" step="0.01" value={f.custom_price_per_kg} onChange={(e) => upd("custom_price_per_kg", e.target.value)} placeholder={platform ? `不低於 ${platform.price_per_kg}` : ""} />
+              {platformHint("price_per_kg")}
+            </label>
+            <label className="fld"><span>宅配匯率</span>
+              <input type="number" step="0.001" value={f.custom_rate_rmb} onChange={(e) => upd("custom_rate_rmb", e.target.value)} placeholder={platform ? `不低於 ${platform.rate_rmb}` : ""} />
+              {platformHint("rate_rmb")}
+            </label>
+            <label className="fld"><span>7-11 匯率</span>
+              <input type="number" step="0.001" value={f.custom_rate_twd} onChange={(e) => upd("custom_rate_twd", e.target.value)} placeholder={platform ? `不低於 ${platform.rate_twd}` : ""} />
+              {platformHint("rate_twd")}
+            </label>
+            <label className="fld"><span>宅配派件費（TWD）</span>
+              <input type="number" step="1" value={f.custom_fee_home} onChange={(e) => upd("custom_fee_home", e.target.value)} placeholder={platform ? `不低於 ${platform.fee_home}` : ""} />
+              {platformHint("fee_home")}
+            </label>
+            <label className="fld"><span>7-11 派件費（TWD）</span>
+              <input type="number" step="1" value={f.custom_fee_711} onChange={(e) => upd("custom_fee_711", e.target.value)} placeholder={platform ? `不低於 ${platform.fee_711}` : ""} />
+              {platformHint("fee_711")}
+            </label>
+          </div>
+        )}
+      </div>
+
+      <div className="card">
+        <h3 className="sec">備註（內部）</h3>
+        <textarea rows="2" style={{ width: "100%", border: "1.5px solid #DCD9CF", borderRadius: 10, padding: 10, fontFamily: "inherit", fontSize: 14 }} value={f.notes} onChange={(e) => upd("notes", e.target.value)} placeholder="僅總後台可見" />
+      </div>
+
+      {err && <div className="err">{err}</div>}
+      <div className="form-actions">
+        <button className="btn ghost" onClick={onCancel}>取消</button>
+        <button className="btn primary" disabled={busy} onClick={save}>{busy ? "儲存中…" : sp ? "儲存變更" : "建立業務員"}</button>
+      </div>
+    </div>
+  );
+}
+
+function SalespersonDetail({ token, sp, onBack, flash }) {
+  const [data, setData] = useState(null);
+  const [settleTab, setSettleTab] = useState("overview"); // overview | settle
+  const [selectedIds, setSelectedIds] = useState([]);
+  const [proofFile, setProofFile] = useState(null);
+  const [proofPreview, setProofPreview] = useState(null);
+  const [settleNote, setSettleNote] = useState("");
+  const [settling, setSettling] = useState(false);
+
+  useEffect(() => {
+    spAdminCall("stats", { salesperson_id: sp.id }, token)
+      .then(setData).catch(e => flash(e.message));
+  }, []);
+  if (!data) return <div className="muted">載入中…</div>;
+  const { users, shipments, commissions } = data;
+  const pendingComs = commissions.filter(c => c.status === "pending");
+  const totalRevenue = shipments.reduce((s, x) => s + Number(x.freight_amount || 0) * (x.currency === "RMB" ? Number(sp.custom_rate_rmb || 4.8) : 1), 0);
+  const pendingCom = pendingComs.reduce((s, c) => s + Number(c.commission_twd || 0), 0);
+  const settledCom = commissions.filter(c => c.status === "settled").reduce((s, c) => s + Number(c.commission_twd || 0), 0);
+
+  const toggleId = (id) => setSelectedIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+  const selectAll = () => setSelectedIds(pendingComs.map(c => c.id));
+  const clearSel = () => setSelectedIds([]);
+  const selectedTotal = pendingComs.filter(c => selectedIds.includes(c.id)).reduce((s, c) => s + Number(c.commission_twd || 0), 0);
+
+  // 上傳轉帳憑證
+  const uploadProof = (file) => {
+    if (!file) return;
+    setProofFile(file);
+    setProofPreview(URL.createObjectURL(file));
+  };
+
+  const doSettle = async () => {
+    if (!selectedIds.length) return flash("請選擇要結算的佣金項目");
+    setSettling(true);
+    try {
+      let proofUrl = null;
+      // 上傳憑證到 Storage
+      if (proofFile) {
+        const ext = proofFile.name.split(".").pop() || "jpg";
+        const path = `settlement/${sp.id}_${Date.now()}.${ext}`;
+        const res = await fetch(`${SUPA_URL}/storage/v1/object/payment-screenshots/${path}`, {
+          method: "POST",
+          headers: { apikey: ANON, Authorization: `Bearer ${token}` },
+          body: proofFile,
+        });
+        if (res.ok) {
+          // 取已簽署 URL 或公開 URL
+          const signRes = await fetch(`${SUPA_URL}/functions/v1/ops-actions`, {
+            method: "POST",
+            headers: { apikey: ANON, Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "signSettlementProof", path }),
+          });
+          const signData = await signRes.json();
+          proofUrl = signData.url || null;
+        }
+      }
+      // 呼叫結算 API
+      const r = await fetch(`${SUPA_URL}/functions/v1/ops-actions`, {
+        method: "POST",
+        headers: { apikey: ANON, Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "settleCommissions",
+          salesperson_id: sp.id,
+          commission_ids: selectedIds,
+          settlement_proof_url: proofUrl,
+          settlement_note: settleNote,
+        }),
+      });
+      const d = await r.json();
+      if (!r.ok || !d.ok) throw new Error(d.error || "結算失敗");
+      flash(`✅ 已結算 ${d.settled_count} 筆佣金，共 NT$${Math.round(selectedTotal)}`);
+      setSelectedIds([]);
+      setProofFile(null); setProofPreview(null); setSettleNote("");
+      // 重新載入
+      const fresh = await spAdminCall("stats", { salesperson_id: sp.id }, token);
+      setData(fresh);
+    } catch (e) { flash(e.message); }
+    setSettling(false);
+  };
+
+  return (
+    <div>
+      <div className="page-h-row">
+        <h2 className="page-t">{sp.name} — 業績詳情</h2>
+        <button className="btn ghost" onClick={onBack}>← 返回列表</button>
+      </div>
+
+      {/* 業務員支付寶收款碼（如有） */}
+      {sp.alipay_qr_url && (
+        <div className="sp-alipay-card">
+          <div className="sp-alipay-label">💙 業務員支付寶收款碼</div>
+          <img className="sp-alipay-qr" src={sp.alipay_qr_url} alt="支付寶收款碼" />
+          <div className="hint sm">結算前請先掃碼轉帳，再點下方「確認結算」</div>
+        </div>
+      )}
+      {!sp.alipay_qr_url && (
+        <div className="warn" style={{ marginBottom: 14 }}>⚠️ 業務員尚未設定支付寶收款碼，請提醒業務員在個人後台上傳。</div>
+      )}
+
+      <div className="stats-row">
+        <div className="stat-card"><b>{users.length}</b><span>客戶數</span></div>
+        <div className="stat-card"><b>{shipments.length}</b><span>訂單數</span></div>
+        <div className="stat-card"><b>NT$ {Math.round(totalRevenue)}</b><span>總營收</span></div>
+        <div className="stat-card highlight"><b>NT$ {Math.round(pendingCom)}</b><span>待結算佣金</span></div>
+        <div className="stat-card"><b>NT$ {Math.round(settledCom)}</b><span>已結佣金</span></div>
+      </div>
+
+      {/* 分頁 */}
+      <div className="subtabs" style={{ marginTop: 18 }}>
+        <button className={"subtab " + (settleTab === "overview" ? "on" : "")} onClick={() => setSettleTab("overview")}>客戶 & 訂單</button>
+        <button className={"subtab " + (settleTab === "settle" ? "on" : "")} onClick={() => setSettleTab("settle")}>
+          佣金結算 {pendingComs.length > 0 && <span className="badge-count">{pendingComs.length}</span>}
+        </button>
+        <button className={"subtab " + (settleTab === "history" ? "on" : "")} onClick={() => setSettleTab("history")}>結算記錄</button>
+      </div>
+
+      {/* 客戶 & 訂單 */}
+      {settleTab === "overview" && (
+        <>
+          <h3 className="sec" style={{ marginTop: 14 }}>客戶名單（{users.length}）</h3>
+          <div className="card">
+            {users.length === 0 ? <div className="muted">尚無客戶</div> : (
+              <table className="tbl">
+                <thead><tr><th>用戶名</th><th>手機</th><th>國家</th><th>額度</th><th>積分</th><th>歸屬時間</th></tr></thead>
+                <tbody>{users.map(u => (
+                  <tr key={u.id}><td>{u.username}</td><td className="mono">{u.phone}</td><td>{u.country}</td><td>NT${u.credit_balance}</td><td>{u.points}</td><td className="sm">{u.referred_at ? new Date(u.referred_at).toLocaleDateString() : "-"}</td></tr>
+                ))}</tbody>
+              </table>
+            )}
+          </div>
+          <h3 className="sec" style={{ marginTop: 18 }}>訂單明細（{shipments.length}）</h3>
+          <div className="card">
+            {shipments.length === 0 ? <div className="muted">尚無訂單</div> : (
+              <table className="tbl">
+                <thead><tr><th>單號</th><th>方式</th><th>狀態</th><th>金額</th><th>時間</th></tr></thead>
+                <tbody>{shipments.slice(0, 50).map(s => (
+                  <tr key={s.id}><td className="mono">{s.order_no}</td><td>{s.delivery_type === "home" ? "宅配" : "7-11"}</td><td>{s.status}</td><td>{s.currency === "RMB" ? "¥" : "NT$"}{s.freight_amount}</td><td className="sm">{new Date(s.created_at).toLocaleDateString()}</td></tr>
+                ))}</tbody>
+              </table>
+            )}
+          </div>
+        </>
+      )}
+
+      {/* 佣金結算操作 */}
+      {settleTab === "settle" && (
+        <div>
+          <div className="settle-info">
+            <div className="settle-title">本期待結算佣金</div>
+            <div className="settle-amount">NT$ {Math.round(pendingCom)}</div>
+            <div className="settle-count">{pendingComs.length} 筆佣金待結算</div>
+          </div>
+
+          {pendingComs.length === 0 ? (
+            <div className="empty" style={{ marginTop: 14 }}>目前沒有待結算的佣金 🎉</div>
+          ) : (
+            <>
+              <div className="settle-sel-row">
+                <button className="btn tiny" onClick={selectAll}>全選（{pendingComs.length} 筆）</button>
+                {selectedIds.length > 0 && <button className="btn ghost tiny" onClick={clearSel}>清除選擇</button>}
+                {selectedIds.length > 0 && <span className="settle-sel-hint">已選 {selectedIds.length} 筆，合計 NT$ {Math.round(selectedTotal)}</span>}
+              </div>
+              <div className="card" style={{ marginTop: 10 }}>
+                <table className="tbl">
+                  <thead><tr><th style={{width:40}}></th><th>訂單</th><th>金額</th><th>佣金率</th><th>佣金</th><th>建立時間</th></tr></thead>
+                  <tbody>{pendingComs.map(c => (
+                    <tr key={c.id} className={selectedIds.includes(c.id) ? "row-selected" : ""} onClick={() => toggleId(c.id)} style={{cursor:"pointer"}}>
+                      <td><input type="checkbox" checked={selectedIds.includes(c.id)} onChange={() => toggleId(c.id)} onClick={e => e.stopPropagation()} /></td>
+                      <td className="mono">{c.order_no}</td>
+                      <td>NT${c.order_amount}</td>
+                      <td>{c.commission_rate}%</td>
+                      <td><b style={{color:"#c97800"}}>NT${c.commission_twd}</b></td>
+                      <td className="sm">{new Date(c.created_at).toLocaleDateString()}</td>
+                    </tr>
+                  ))}</tbody>
+                </table>
+              </div>
+
+              {selectedIds.length > 0 && (
+                <div className="settle-action-card">
+                  <div className="settle-action-title">確認結算 {selectedIds.length} 筆，共 NT$ {Math.round(selectedTotal)}</div>
+                  <div className="settle-step">
+                    <div className="settle-step-num">1</div>
+                    <div>
+                      <b>掃描業務員支付寶二維碼轉帳</b>
+                      <div className="hint sm">金額：NT$ {Math.round(selectedTotal)}（請按實際匯率換算 RMB）</div>
+                    </div>
+                  </div>
+                  <div className="settle-step">
+                    <div className="settle-step-num">2</div>
+                    <div>
+                      <b>上傳轉帳憑證截圖</b>
+                      <label className="settle-upload">
+                        {proofPreview ? <img src={proofPreview} alt="憑證" className="settle-proof-preview" /> : <span>＋ 點擊上傳截圖（選填）</span>}
+                        <input type="file" accept="image/*" hidden onChange={e => uploadProof(e.target.files?.[0])} />
+                      </label>
+                    </div>
+                  </div>
+                  <div className="settle-step">
+                    <div className="settle-step-num">3</div>
+                    <div style={{flex:1}}>
+                      <b>備註（選填）</b>
+                      <input className="settle-note" value={settleNote} onChange={e => setSettleNote(e.target.value)} placeholder="例：12月佣金，支付寶已匯" />
+                    </div>
+                  </div>
+                  <button className="btn primary block" style={{marginTop:14}} disabled={settling} onClick={doSettle}>
+                    {settling ? "結算中…" : `✅ 確認結算 NT$${Math.round(selectedTotal)}`}
+                  </button>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      {/* 結算記錄 */}
+      {settleTab === "history" && (
+        <div>
+          <div className="card" style={{ marginTop: 14 }}>
+            {commissions.length === 0 ? <div className="muted">尚無佣金記錄</div> : (
+              <table className="tbl">
+                <thead><tr><th>訂單</th><th>金額</th><th>比例</th><th>佣金</th><th>狀態</th><th>結算時間</th><th>結算人</th></tr></thead>
+                <tbody>{commissions.map(c => (
+                  <tr key={c.id}>
+                    <td className="mono">{c.order_no}</td>
+                    <td>NT${c.order_amount}</td>
+                    <td>{c.commission_rate}%</td>
+                    <td><b>NT${c.commission_twd}</b></td>
+                    <td><span className={"chip " + (c.status === "settled" ? "chip-leaf" : "chip-sea")}>{c.status === "settled" ? "已結" : "待結"}</span></td>
+                    <td className="sm">{c.settled_at ? new Date(c.settled_at).toLocaleDateString() : "-"}</td>
+                    <td className="sm">{c.settled_by || "-"}</td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ===================== 業務員後台 ===================== */
+async function spApiCall(action, payload, sp_token, sp_id) {
+  const r = await fetch(`${SUPA_URL}/functions/v1/salesperson-api`, {
+    method: "POST",
+    headers: { apikey: ANON, "Content-Type": "application/json" },
+    body: JSON.stringify({ action, sp_token, sp_id, ...payload }),
+  });
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.error || "操作失敗");
+  return d;
+}
+
+function SpDashboard({ spSession, setSpSession, onLogout, flash }) {
+  const sp = spSession.salesperson;
+  const NAV = [
+    { key: "dash",     label: "儀表板", icon: "📊" },
+    { key: "promo",    label: "我的推廣", icon: "🔗" },
+    { key: "customers",label: "我的客戶", icon: "👥" },
+    { key: "orders",   label: "訂單明細", icon: "📋" },
+    { key: "shipments",label: "發貨明細", icon: "📦" },
+    { key: "finance",  label: "財務明細", icon: "💰" },
+    { key: "rates",    label: "我的費率", icon: "⚙" },
+    { key: "profile",  label: "個人設定", icon: "👤" },
+  ];
+  const [tab, setTab] = useState("dash");
+  const [data, setData] = useState(null);
+  const load = async () => {
+    try {
+      const r = await spApiCall("dashboard", {}, spSession.sp_token, spSession.sp_id);
+      setData(r);
+    } catch (e) { flash(e.message); }
+  };
+  useEffect(() => { load(); const t = setInterval(load, 30000); return () => clearInterval(t); }, []);
+
+  // 重新載入 sp 個人資訊（更新後刷新）
+  const reloadSp = async () => {
+    try {
+      const r = await spApiCall("me", {}, spSession.sp_token, spSession.sp_id);
+      setSpSession({ ...spSession, salesperson: r.salesperson });
+      saveSpSess({ ...spSession, salesperson: r.salesperson });
+    } catch (e) {}
+  };
+
+  return (
+    <div className="dash sp-mode">
+      <header className="topbar sp-bar">
+        <div className="brand-row sm"><div className="brand-mark sm sp">業</div><b>業務員後台</b></div>
+        <div className="who">
+          <span className="role-badge sp-role">業務員</span>
+          <span className="who-name">{sp.name}</span>
+          <button className="btn ghost tiny" onClick={onLogout}>登出</button>
+        </div>
+      </header>
+      <div className="sp-banner">
+        🎯 您正在以業務員身份登入 · 您只能查看名下客戶的相關資料
+      </div>
+      <div className="body">
+        <nav className="side">
+          {NAV.map((n) => <button key={n.key} className={"nav " + (tab === n.key ? "on" : "")} onClick={() => setTab(n.key)}><span className="nav-i">{n.icon}</span>{n.label}</button>)}
+        </nav>
+        <main className="main">
+          {tab === "dash" && <SpHome sp={sp} data={data} />}
+          {tab === "promo" && <SpPromo sp={sp} flash={flash} />}
+          {tab === "customers" && <SpCustomers data={data} />}
+          {tab === "orders" && <SpOrders data={data} />}
+          {tab === "shipments" && <SpShipments data={data} />}
+          {tab === "finance" && <SpFinance sp={sp} data={data} />}
+          {tab === "rates" && <SpRates sp={sp} spSession={spSession} reloadSp={reloadSp} flash={flash} />}
+          {tab === "profile" && <SpProfile sp={sp} spSession={spSession} reloadSp={reloadSp} flash={flash} />}
+        </main>
+      </div>
+    </div>
+  );
+}
+
+function SpHome({ sp, data }) {
+  if (!data) return <div className="muted">載入中…</div>;
+  const stats = data.stats || {};
+  return (
+    <div>
+      <h2 className="page-t">您好，{sp.name} 👋</h2>
+      <div className="hint" style={{ marginBottom: 16 }}>佣金比例：<b>{sp.commission_rate}%</b>　|　推廣碼：<b className="mono">{sp.promo_code}</b></div>
+      <div className="stats-row">
+        <div className="stat-card"><b>{stats.total_customers}</b><span>累計客戶</span></div>
+        <div className="stat-card"><b>{stats.month_orders}</b><span>本月訂單</span></div>
+        <div className="stat-card"><b>{stats.total_orders}</b><span>累計訂單</span></div>
+        <div className="stat-card"><b>NT$ {Math.round(stats.total_revenue_twd)}</b><span>累計營收</span></div>
+        <div className="stat-card highlight"><b>NT$ {Math.round(stats.pending_commission)}</b><span>待結算佣金</span></div>
+        <div className="stat-card"><b>NT$ {Math.round(stats.settled_commission)}</b><span>已結佣金</span></div>
+      </div>
+      <div className="card" style={{ marginTop: 16 }}>
+        <h3 className="sec">最近訂單</h3>
+        {(data.shipments || []).length === 0 ? <div className="muted">尚無訂單</div> : (
+          <table className="tbl">
+            <thead><tr><th>單號</th><th>狀態</th><th>金額</th><th>時間</th></tr></thead>
+            <tbody>{data.shipments.slice(0, 10).map(s => (
+              <tr key={s.id}>
+                <td className="mono">{s.order_no}</td>
+                <td>{s.status}</td>
+                <td>{s.currency === "RMB" ? "¥" : "NT$"}{s.freight_amount}</td>
+                <td className="sm">{new Date(s.created_at).toLocaleString("zh-TW")}</td>
+              </tr>
+            ))}</tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SpPromo({ sp, flash }) {
+  const baseUrl = typeof window !== "undefined" ? `${window.location.protocol}//${window.location.host.replace("admin.", "").replace("yunqiaoguoji-admin", "yunqiaoguoji-user")}` : "https://yunqiaoguoji.com";
+  const url = `${baseUrl}/?ref=${sp.promo_code}`;
+  const copy = async (text, label) => {
+    try {
+      await navigator.clipboard?.writeText(text);
+      flash(`已複製${label || ""}`);
+    } catch { flash("複製失敗"); }
+  };
+  return (
+    <div>
+      <h2 className="page-t">我的推廣</h2>
+      <div className="card">
+        <h3 className="sec">推廣連結</h3>
+        <div className="promo-url-box">
+          <div className="promo-url mono">{url}</div>
+          <button className="btn primary" onClick={() => copy(url, "推廣連結")}>📋 複製連結</button>
+        </div>
+        <div className="hint sm" style={{ marginTop: 8 }}>分享此連結，客戶透過此連結註冊後 30 天內歸屬於您</div>
+      </div>
+      <div className="card">
+        <h3 className="sec">推廣碼</h3>
+        <div className="promo-code-display">
+          <span className="mono">{sp.promo_code}</span>
+          <button className="btn ghost" onClick={() => copy(sp.promo_code, "推廣碼")}>複製</button>
+        </div>
+      </div>
+      <div className="card">
+        <h3 className="sec">推廣 QR Code</h3>
+        <div className="qr-wrap">
+          <img className="qr-img" src={`https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(url)}`} alt="推廣 QR" />
+          <div className="hint">客戶掃描此 QR Code 將直接進入您的推廣連結</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// 業務員後台共用時間篩選 Hook
+function useSpDateFilter(allShipments, allUsers, allCommissions, dateKey = "created_at") {
+  const [range, setRange] = React.useState({ start: monthStart(), end: today() });
+  const [showFilter, setShowFilter] = React.useState(false);
+
+  const inRange = (dateStr) => {
+    if (!dateStr) return false;
+    const d = dateStr.slice(0, 10);
+    return d >= range.start && d <= range.end;
+  };
+  const lastRange = { start: monthStart(-1), end: monthEnd(-1) };
+  const inLast = (dateStr) => {
+    if (!dateStr) return false;
+    const d = dateStr.slice(0, 10);
+    return d >= lastRange.start && d <= lastRange.end;
+  };
+
+  const ships = (allShipments || []).filter(s => inRange(s[dateKey]));
+  const lastShips = (allShipments || []).filter(s => inLast(s[dateKey]));
+  const users = (allUsers || []).filter(u => inRange(u.referred_at || u.created_at));
+  const lastUsers = (allUsers || []).filter(u => inLast(u.referred_at || u.created_at));
+  const coms = (allCommissions || []).filter(c => inRange(c.created_at));
+  const lastComs = (allCommissions || []).filter(c => inLast(c.created_at));
+
+  const filterUI = (
+    <div className="sp-filter-bar">
+      <button className={"drp-btn" + (showFilter ? " on" : "")} onClick={() => setShowFilter(v=>!v)}>
+        📅 {range.start} ～ {range.end} ▾
+      </button>
+      {showFilter && <DateRangePicker value={range} onChange={r => { setRange(r); setShowFilter(false); }} />}
+    </div>
+  );
+
+  return { range, ships, lastShips, users, lastUsers, coms, lastComs, filterUI };
+}
+
+function SpCustomers({ data }) {
+  const allUsers = data?.users || [];
+  const { ships, users, lastUsers, filterUI } = useSpDateFilter(data?.shipments, allUsers, data?.commissions, "referred_at");
+  return (
+    <div>
+      <div className="page-h-row"><h2 className="page-t">我的客戶</h2></div>
+      {filterUI}
+      <div className="kpi-grid" style={{marginBottom:12}}>
+        <KpiCard label="期間新增客戶" value={users.length} trend={lastUsers.length} trendLabel={`上月 ${lastUsers.length}`} highlight />
+        <KpiCard label="累計總客戶" value={allUsers.length} />
+      </div>
+      <div className="card">
+        {users.length === 0 ? <div className="empty">此時段無新增客戶</div> : (
+          <table className="tbl">
+            <thead><tr><th>用戶名</th><th>手機</th><th>國家</th><th>運費額度</th><th>積分</th><th>歸屬時間</th></tr></thead>
+            <tbody>{users.map(u => (
+              <tr key={u.id}>
+                <td>{u.username}</td><td className="mono">{u.phone}</td><td>{u.country}</td>
+                <td>NT${u.credit_balance}</td><td>{u.points}</td>
+                <td className="sm">{u.referred_at ? new Date(u.referred_at).toLocaleDateString() : "-"}</td>
+              </tr>
+            ))}</tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SpOrders({ data }) {
+  const allShips = data?.shipments || [];
+  const { ships, lastShips, filterUI } = useSpDateFilter(allShips, [], [], "created_at");
+  const rmb = ships.reduce((s, x) => s + (x.currency === "RMB" ? Number(x.freight_amount||0) : 0), 0);
+  const twd = ships.reduce((s, x) => s + (x.currency === "TWD" ? Number(x.freight_amount||0) : 0), 0);
+  const wt = ships.reduce((s, x) => s + Number(x.total_weight||0), 0);
+  const lastRmb = lastShips.reduce((s, x) => s + (x.currency === "RMB" ? Number(x.freight_amount||0) : 0), 0);
+  const lastTwd = lastShips.reduce((s, x) => s + (x.currency === "TWD" ? Number(x.freight_amount||0) : 0), 0);
+  return (
+    <div>
+      <div className="page-h-row"><h2 className="page-t">訂單明細</h2></div>
+      {filterUI}
+      <div className="kpi-grid" style={{marginBottom:12}}>
+        <KpiCard label="期間訂單數" value={ships.length} trend={lastShips.length} trendLabel={`上月 ${lastShips.length}`} highlight />
+        <KpiCard label="RMB 收入"   value={`¥${rmb.toFixed(2)}`} trend={lastRmb} trendLabel={`上月 ¥${lastRmb.toFixed(2)}`} />
+        <KpiCard label="TWD 收入"   value={`NT$${twd.toFixed(2)}`} trend={lastTwd} trendLabel={`上月 NT$${lastTwd.toFixed(2)}`} />
+        <KpiCard label="總重量"     value={`${wt.toFixed(2)}kg`} />
+      </div>
+      <div className="card">
+        {ships.length === 0 ? <div className="empty">此時段無訂單</div> : (
+          <table className="tbl">
+            <thead><tr><th>單號</th><th>方式</th><th>狀態</th><th>重量</th><th>金額</th><th>建立時間</th></tr></thead>
+            <tbody>{ships.map(s => (
+              <tr key={s.id}>
+                <td className="mono">{s.order_no}</td>
+                <td>{s.delivery_type === "home" ? "宅配" : "7-11"}</td>
+                <td>{s.status}</td>
+                <td>{s.total_weight}kg</td>
+                <td>{s.currency === "RMB" ? "¥" : "NT$"}{s.freight_amount}</td>
+                <td className="sm">{new Date(s.created_at).toLocaleString("zh-TW")}</td>
+              </tr>
+            ))}</tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SpShipments({ data }) {
+  const allShips = (data?.shipments || []).filter(s => s.status === "shipped" || s.status === "completed");
+  const { ships, lastShips, filterUI } = useSpDateFilter(allShips, [], [], "shipped_at");
+  const wt = ships.reduce((s, x) => s + Number(x.total_weight||0), 0);
+  return (
+    <div>
+      <div className="page-h-row"><h2 className="page-t">發貨明細</h2></div>
+      {filterUI}
+      <div className="kpi-grid" style={{marginBottom:12}}>
+        <KpiCard label="期間已發貨" value={ships.length} trend={lastShips.length} trendLabel={`上月 ${lastShips.length}`} highlight />
+        <KpiCard label="期間總重量" value={`${wt.toFixed(2)}kg`} />
+      </div>
+      <div className="card">
+        {ships.length === 0 ? <div className="empty">此時段無已發貨訂單</div> : (
+          <table className="tbl">
+            <thead><tr><th>單號</th><th>物流商</th><th>物流單號</th><th>發貨時間</th></tr></thead>
+            <tbody>{ships.map(s => (
+              <tr key={s.id}>
+                <td className="mono">{s.order_no}</td>
+                <td>{s.return_carrier || "-"}</td>
+                <td className="mono">{s.return_tracking_no || "-"}</td>
+                <td className="sm">{s.shipped_at ? new Date(s.shipped_at).toLocaleString("zh-TW") : "-"}</td>
+              </tr>
+            ))}</tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SpFinance({ sp, data }) {
+  const allShips = data?.shipments || [];
+  const allComs = data?.commissions || [];
+  const { ships, lastShips, coms, lastComs, filterUI } = useSpDateFilter(allShips, [], allComs, "created_at");
+
+  const rmb = ships.reduce((s, x) => s + (x.currency === "RMB" ? Number(x.freight_amount||0) : 0), 0);
+  const twd = ships.reduce((s, x) => s + (x.currency === "TWD" ? Number(x.freight_amount||0) : 0), 0);
+  const lastRmb = lastShips.reduce((s, x) => s + (x.currency === "RMB" ? Number(x.freight_amount||0) : 0), 0);
+  const lastTwd = lastShips.reduce((s, x) => s + (x.currency === "TWD" ? Number(x.freight_amount||0) : 0), 0);
+  const pendingCom = coms.filter(c => c.status === "pending").reduce((s, c) => s + Number(c.commission_twd), 0);
+  const settledCom = coms.filter(c => c.status === "settled").reduce((s, c) => s + Number(c.commission_twd), 0);
+  const lastPending = lastComs.filter(c => c.status === "pending").reduce((s, c) => s + Number(c.commission_twd), 0);
+
+  // 全期累計
+  const totalPending = allComs.filter(c => c.status === "pending").reduce((s, c) => s + Number(c.commission_twd), 0);
+  const totalSettled = allComs.filter(c => c.status === "settled").reduce((s, c) => s + Number(c.commission_twd), 0);
+
+  return (
+    <div>
+      <div className="page-h-row"><h2 className="page-t">財務明細</h2></div>
+
+      {/* 累計總覽 */}
+      <div className="stats-row" style={{marginBottom:12}}>
+        <div className="stat-card highlight"><b>NT$ {Math.round(totalPending)}</b><span>累計待結算佣金</span></div>
+        <div className="stat-card"><b>NT$ {Math.round(totalSettled)}</b><span>累計已結佣金</span></div>
+        <div className="stat-card"><b>{sp.commission_rate}%</b><span>佣金比例</span></div>
+      </div>
+
+      {filterUI}
+      <div className="kpi-grid" style={{marginBottom:12}}>
+        <KpiCard label="期間 RMB 收入" value={`¥${rmb.toFixed(2)}`} trend={lastRmb} trendLabel={`上月 ¥${lastRmb.toFixed(2)}`} highlight />
+        <KpiCard label="期間 TWD 收入" value={`NT$${twd.toFixed(2)}`} trend={lastTwd} trendLabel={`上月 NT$${lastTwd.toFixed(2)}`} highlight />
+        <KpiCard label="期間待結佣金" value={`NT$${Math.round(pendingCom)}`} trend={lastPending} trendLabel={`上月 NT$${Math.round(lastPending)}`} />
+        <KpiCard label="期間已結佣金" value={`NT$${Math.round(settledCom)}`} />
+      </div>
+
+      <div className="card">
+        <h3 className="sec">佣金記錄（{coms.length} 筆）</h3>
+        {coms.length === 0 ? <div className="muted">此時段無佣金記錄</div> : (
+          <table className="tbl">
+            <thead><tr><th>訂單</th><th>金額（TWD）</th><th>比例</th><th>佣金</th><th>狀態</th><th>建立時間</th><th>結算時間</th></tr></thead>
+            <tbody>{coms.map(c => (
+              <tr key={c.id}>
+                <td className="mono">{c.order_no}</td>
+                <td>NT${c.order_amount}</td>
+                <td>{c.commission_rate}%</td>
+                <td><b>NT${c.commission_twd}</b></td>
+                <td><span className={"chip " + (c.status === "settled" ? "chip-leaf" : "chip-sea")}>{c.status === "settled" ? "已結" : "待結"}</span></td>
+                <td className="sm">{new Date(c.created_at).toLocaleDateString()}</td>
+                <td className="sm">{c.settled_at ? new Date(c.settled_at).toLocaleDateString() : "-"}</td>
+              </tr>
+            ))}</tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SpRates({ sp, spSession, reloadSp, flash }) {
+  const [platform, setPlatform] = useState(null);
+  const [f, setF] = useState({
+    use_custom_rates: !!sp.use_custom_rates,
+    custom_price_per_kg: sp.custom_price_per_kg ?? "",
+    custom_rate_rmb: sp.custom_rate_rmb ?? "",
+    custom_rate_twd: sp.custom_rate_twd ?? "",
+    custom_fee_home: sp.custom_fee_home ?? "",
+    custom_fee_711: sp.custom_fee_711 ?? "",
+  });
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  useEffect(() => {
+    // 取平台價（業務員不需登入也能讀，因為 RLS 允許 anon read settings）
+    fetch(`${SUPA_URL}/rest/v1/settings?id=eq.1&select=price_per_kg,rate_rmb,rate_twd,fee_home,fee_711`, {
+      headers: { apikey: ANON },
+    }).then(r => r.json()).then(rows => setPlatform(rows[0] || null)).catch(() => {});
+  }, []);
+  const upd = (k, v) => setF({ ...f, [k]: v });
+  const save = async () => {
+    setErr(""); setBusy(true);
+    try {
+      const payload = { ...f };
+      ["custom_price_per_kg","custom_rate_rmb","custom_rate_twd","custom_fee_home","custom_fee_711"]
+        .forEach(k => { payload[k] = payload[k] === "" ? null : Number(payload[k]); });
+      await spApiCall("updateRates", payload, spSession.sp_token, spSession.sp_id);
+      await reloadSp();
+      flash("已儲存費率設定");
+    } catch (e) { setErr(e.message); }
+    setBusy(false);
+  };
+  const hint = (k) => platform ? <div className="hint sm">平台價：{platform[k]}（不得低於此價）</div> : null;
+
+  return (
+    <div>
+      <h2 className="page-t">我的費率設定</h2>
+      <div className="card">
+        <div className="hint" style={{ marginBottom: 14, lineHeight: 1.7 }}>
+          您可以設定自己客戶看到的費率與匯率。<br />
+          <b style={{ color: "#B91C1C" }}>注意：所有費率不得低於平台價。</b>儲存後立即生效，名下新訂單會自動使用您的費率。
+        </div>
+        <label className="switch">
+          <input type="checkbox" checked={f.use_custom_rates} onChange={(e) => upd("use_custom_rates", e.target.checked)} />
+          <span><b>啟用自訂費率</b>（不啟用則使用平台統一價）</span>
+        </label>
+
+        {f.use_custom_rates && (
+          <div className="form-grid" style={{ marginTop: 14 }}>
+            <label className="fld"><span>每公斤運費（RMB）</span>
+              <input type="number" step="0.01" value={f.custom_price_per_kg} onChange={(e) => upd("custom_price_per_kg", e.target.value)} placeholder={platform ? `平台 ${platform.price_per_kg}` : ""} />
+              {hint("price_per_kg")}
+            </label>
+            <label className="fld"><span>宅配匯率（RMB→TWD）</span>
+              <input type="number" step="0.001" value={f.custom_rate_rmb} onChange={(e) => upd("custom_rate_rmb", e.target.value)} placeholder={platform ? `平台 ${platform.rate_rmb}` : ""} />
+              {hint("rate_rmb")}
+            </label>
+            <label className="fld"><span>7-11 匯率（RMB→TWD）</span>
+              <input type="number" step="0.001" value={f.custom_rate_twd} onChange={(e) => upd("custom_rate_twd", e.target.value)} placeholder={platform ? `平台 ${platform.rate_twd}` : ""} />
+              {hint("rate_twd")}
+            </label>
+            <label className="fld"><span>宅配派件費（TWD）</span>
+              <input type="number" step="1" value={f.custom_fee_home} onChange={(e) => upd("custom_fee_home", e.target.value)} placeholder={platform ? `平台 ${platform.fee_home}` : ""} />
+              {hint("fee_home")}
+            </label>
+            <label className="fld"><span>7-11 派件費（TWD）</span>
+              <input type="number" step="1" value={f.custom_fee_711} onChange={(e) => upd("custom_fee_711", e.target.value)} placeholder={platform ? `平台 ${platform.fee_711}` : ""} />
+              {hint("fee_711")}
+            </label>
+          </div>
+        )}
+        {err && <div className="err">{err}</div>}
+        <button className="btn primary block" disabled={busy} onClick={save}>{busy ? "儲存中…" : "儲存費率"}</button>
+      </div>
+    </div>
+  );
+}
+
+function SpProfile({ sp, spSession, reloadSp, flash }) {
+  const [f, setF] = useState({
+    wechat: sp.wechat || "",
+    wechat_qr_url: sp.wechat_qr_url || "",
+    line_id: sp.line_id || "",
+    whatsapp: sp.whatsapp || "",
+    alipay_qr_url: sp.alipay_qr_url || "",
+    old_password: "",
+    new_password: "",
+    new_password2: "",
+  });
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [alipayPreview, setAlipayPreview] = useState(sp.alipay_qr_url || null);
+  const upd = (k, v) => setF({ ...f, [k]: v });
+
+  // 上傳支付寶二維碼到 Storage
+  const uploadAlipay = async (file) => {
+    if (!file) return;
+    try {
+      const ext = file.name.split(".").pop() || "jpg";
+      const path = `sp-alipay/${spSession.sp_id}_${Date.now()}.${ext}`;
+      const formData = new FormData();
+      formData.append("", file);
+      const res = await fetch(
+        `${SUPA_URL}/storage/v1/object/payment-qr/${path}`,
+        { method: "POST", headers: { apikey: ANON, Authorization: `Bearer ${spSession.sp_token}` }, body: file }
+      );
+      if (!res.ok) throw new Error("上傳失敗");
+      // 取公開 URL
+      const pub = `${SUPA_URL}/storage/v1/object/public/payment-qr/${path}`;
+      setAlipayPreview(pub);
+      setF(prev => ({ ...prev, alipay_qr_url: pub }));
+      flash("支付寶二維碼已上傳");
+    } catch (e) { flash(`上傳失敗：${e.message}`); }
+  };
+
+  const save = async () => {
+    setErr(""); setBusy(true);
+    try {
+      const payload = {
+        wechat: f.wechat || null,
+        wechat_qr_url: f.wechat_qr_url || null,
+        line_id: f.line_id || null,
+        whatsapp: f.whatsapp || null,
+        alipay_qr_url: f.alipay_qr_url || null,
+      };
+      if (f.new_password) {
+        if (f.new_password !== f.new_password2) throw new Error("兩次新密碼不一致");
+        if (f.new_password.length < 6) throw new Error("新密碼至少 6 碼");
+        payload.old_password = f.old_password;
+        payload.new_password = f.new_password;
+      }
+      await spApiCall("updateProfile", payload, spSession.sp_token, spSession.sp_id);
+      await reloadSp();
+      setF(prev => ({ ...prev, old_password: "", new_password: "", new_password2: "" }));
+      flash("已儲存");
+    } catch (e) { setErr(e.message); }
+    setBusy(false);
+  };
+  return (
+    <div>
+      <h2 className="page-t">個人設定</h2>
+      <div className="card">
+        <h3 className="sec">基本資訊</h3>
+        <label className="fld"><span>姓名</span><input value={sp.name} disabled /></label>
+        <label className="fld"><span>登入帳號</span><input className="mono" value={sp.username} disabled /></label>
+        <label className="fld"><span>推廣碼</span><input className="mono" value={sp.promo_code} disabled /></label>
+        <label className="fld"><span>佣金比例</span><input value={`${sp.commission_rate}%`} disabled /></label>
+        <div className="hint sm">以上資訊由總後台管理，如需修改請聯繫公司管理員</div>
+      </div>
+
+      <div className="card">
+        <h3 className="sec">聯繫方式（您客戶看到的客服資訊）</h3>
+        <div className="form-grid">
+          <label className="fld"><span>微信號</span><input className="mono" value={f.wechat} onChange={(e) => upd("wechat", e.target.value)} /></label>
+          <label className="fld"><span>微信二維碼 URL</span><input className="mono" value={f.wechat_qr_url} onChange={(e) => upd("wechat_qr_url", e.target.value)} placeholder="https://..." /></label>
+          <label className="fld"><span>LINE ID</span><input className="mono" value={f.line_id} onChange={(e) => upd("line_id", e.target.value)} placeholder="不要加 @" /></label>
+          <label className="fld"><span>WhatsApp</span><input className="mono" value={f.whatsapp} onChange={(e) => upd("whatsapp", e.target.value)} placeholder="+886912345678" /></label>
+        </div>
+      </div>
+
+      <div className="card">
+        <h3 className="sec">支付寶收款碼（用於佣金結算）</h3>
+        <div className="hint" style={{ marginBottom: 12, lineHeight: 1.7 }}>
+          上傳您的支付寶收款二維碼，總後台進行佣金結算時會掃碼轉帳給您。
+        </div>
+        <div className="alipay-upload-box">
+          {alipayPreview ? (
+            <div className="alipay-preview-wrap">
+              <img className="alipay-preview" src={alipayPreview} alt="支付寶收款碼" />
+              <div className="alipay-preview-label">✅ 已設定支付寶收款碼</div>
+            </div>
+          ) : (
+            <div className="alipay-empty">📱 尚未上傳支付寶收款碼</div>
+          )}
+          <label className="alipay-upload-btn">
+            {alipayPreview ? "重新上傳" : "📤 上傳支付寶收款碼"}
+            <input type="file" accept="image/*" hidden onChange={e => uploadAlipay(e.target.files?.[0])} />
+          </label>
+        </div>
+        <div className="hint sm" style={{ marginTop: 8 }}>支援 JPG、PNG 格式。請確保二維碼清晰可掃描。</div>
+      </div>
+
+      <div className="card">
+        <h3 className="sec">修改密碼</h3>
+        <div className="form-grid">
+          <label className="fld"><span>舊密碼</span><input type="password" value={f.old_password} onChange={(e) => upd("old_password", e.target.value)} placeholder="留空表示不改密碼" /></label>
+          <label className="fld"><span>新密碼</span><input type="password" value={f.new_password} onChange={(e) => upd("new_password", e.target.value)} placeholder="至少 6 碼" /></label>
+          <label className="fld"><span>確認新密碼</span><input type="password" value={f.new_password2} onChange={(e) => upd("new_password2", e.target.value)} /></label>
+        </div>
+      </div>
+
+      {err && <div className="err">{err}</div>}
+      <button className="btn primary block" disabled={busy} onClick={save}>{busy ? "儲存中…" : "儲存"}</button>
+    </div>
+  );
+}
+
+const CSS = `
+*{box-sizing:border-box}
+.admin-wrap{font-family:Inter,system-ui,sans-serif;color:#0E2A33;background:#EEF1F0;min-height:100vh}
+.btn{border:1.5px solid #DCD9CF;background:#fff;color:#0E2A33;border-radius:10px;padding:10px 15px;font-size:14px;font-weight:600;font-family:inherit;cursor:pointer}
+.btn.primary{background:#F4A23C;border-color:#F4A23C;color:#27190a}
+.btn.ghost{background:transparent;border-style:dashed;color:#0F7C8A;border-color:#9cc6cc}
+.btn.tiny{padding:6px 11px;font-size:12.5px}
+.btn.danger{color:#c0392b;border-color:#e6b8b4}
+.btn.block{width:100%}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.fld{display:block;margin-bottom:13px}
+.fld span,.fld-label{display:block;font-size:12.5px;color:#5a6a6e;margin-bottom:6px;font-weight:600}
+.fld input{width:100%;border:1.5px solid #DCD9CF;border-radius:10px;padding:11px 12px;font-size:15px;font-family:inherit;outline:none}
+.fld input:focus{border-color:#0F7C8A}
+.mono{font-family:'Space Mono',monospace}
+.err{background:#fdecea;color:#c0392b;padding:9px 12px;border-radius:9px;font-size:13px;margin:8px 0}
+.warn{background:#FFF3E0;color:#8a5a12;padding:9px 12px;border-radius:9px;font-size:12.5px;margin:8px 0}
+.ok{background:#E2F3EC;color:#2FA37A;padding:9px 12px;border-radius:9px;font-size:13px;margin:8px 0;font-weight:600}
+.muted{color:#8a9699;font-size:14px}.muted.sm,.sm{font-size:12px}
+.hint{font-size:11.5px;color:#8a9699;margin-top:8px}
+.empty.big{padding:50px 18px;text-align:center;color:#8a9699;font-size:15px}
+.card{background:#fff;border:1px solid #E6E2D8;border-radius:14px;padding:15px;margin-bottom:14px}
+.coupon-row{display:flex;gap:9px}.coupon-row input{flex:1}
+.form-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
+.form-grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+
+.login{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;background:radial-gradient(120% 80% at 50% 0%,#14323b,#0c2128)}
+.login-card{background:#fff;border-radius:20px;padding:30px 26px;width:100%;max-width:380px;box-shadow:0 30px 70px rgba(0,0,0,.4)}
+.brand-row{display:flex;align-items:center;gap:12px;margin-bottom:22px}
+.brand-mark{width:46px;height:46px;border-radius:13px;background:#0F7C8A;color:#fff;display:flex;align-items:center;justify-content:center;font-size:24px;font-weight:700;font-family:'Space Grotesk'}
+.brand-mark.sm{width:34px;height:34px;font-size:18px;border-radius:10px}
+.brand-t{font-family:'Space Grotesk';font-size:20px;font-weight:700}.brand-s{font-size:12.5px;color:#8a9699}
+
+.topbar{display:flex;align-items:center;justify-content:space-between;background:#0E2A33;color:#fff;padding:12px 18px}
+.brand-row.sm{margin:0;gap:9px}.brand-row.sm b{font-family:'Space Grotesk';font-size:16px}
+.who{display:flex;align-items:center;gap:10px;font-size:13px}.who-name{opacity:.85}
+.body{display:flex;min-height:calc(100vh - 58px);max-width:1100px;margin:0 auto}
+.side{width:210px;padding:16px 12px;flex-shrink:0}
+.nav{display:flex;align-items:center;gap:10px;width:100%;border:0;background:0;text-align:left;padding:11px 13px;border-radius:11px;font-size:14.5px;font-weight:600;color:#3a4a4e;font-family:inherit;cursor:pointer;margin-bottom:4px;position:relative}
+.nav.on{background:#fff;color:#0F7C8A;box-shadow:0 2px 8px rgba(0,0,0,.05)}
+.nav.soon{opacity:.5;cursor:default}.nav-i{width:24px;text-align:center}
+.soon-tag{position:absolute;right:10px;font-style:normal;font-size:10px;background:#E7EAE9;color:#8a9699;padding:1px 7px;border-radius:8px;font-weight:600}
+.main{flex:1;padding:22px;min-width:0}
+.page-t{font-family:'Space Grotesk';font-size:22px;margin:0 0 16px}
+.page-head{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px}.page-head .page-t{margin:0}
+.welcome{background:#fff;border:1px solid #E6E2D8;border-radius:14px;padding:20px;line-height:1.9;color:#3a4a4e}
+
+.subtabs{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}
+.subtab{border:1px solid #DCD9CF;background:#fff;border-radius:20px;padding:8px 16px;font-size:13.5px;font-weight:600;color:#3a4a4e;font-family:inherit;cursor:pointer}
+.subtab.on{background:#0F7C8A;border-color:#0F7C8A;color:#fff}
+
+.scanner{margin:6px 0}
+.scan-video{width:100%;max-width:380px;border-radius:12px;background:#000;aspect-ratio:4/3;object-fit:cover;display:block;margin-bottom:8px}
+.scan-note{font-size:12.5px;color:#8a5a12;background:#FFF3E0;border-radius:9px;padding:10px 12px;margin-bottom:8px}
+
+.user-card .uc-h{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px}
+.user-card .uc-h b{font-size:17px;font-family:'Space Grotesk'}
+.batch{margin:8px 0;display:flex;flex-direction:column;gap:6px}
+.batch-row{display:flex;align-items:center;gap:8px;padding:7px 10px;border:1px solid #EEE;border-radius:9px;flex-wrap:wrap}
+.batch-row.cur{border-color:#F4A23C;background:#FFF8EF}
+.suggest{background:#EAF4F5;color:#0F7C8A;border-radius:10px;padding:10px 12px;font-size:13px;margin-top:8px}
+.suggest b{font-size:15px}
+.chip{font-size:11px;font-weight:600;padding:3px 9px;border-radius:20px}
+.chip-grey{background:#ECEFEF;color:#6b7a7e}.chip-sea{background:#E0F0F2;color:#0F7C8A}.chip-alert{background:#FBE3E2;color:#D9534F}.chip-leaf{background:#E2F3EC;color:#2FA37A}
+.shelf{font-size:11px;background:#EAF4F5;color:#0F7C8A;padding:2px 8px;border-radius:6px;font-weight:600}
+
+.weigh .weigh-h{font-family:'Space Grotesk';font-weight:600;font-size:15px;margin-bottom:12px}
+.upload{display:flex;align-items:center;justify-content:center;border:2px dashed #cdd5d5;border-radius:12px;height:130px;color:#8a9699;font-size:14px;overflow:hidden;cursor:pointer;margin-bottom:10px}
+.upload img{width:100%;height:100%;object-fit:cover}
+.abn-photo{width:100%;max-width:240px;border-radius:10px;margin:8px 0;display:block}
+
+.role-badge{font-size:11px;font-weight:700;padding:3px 9px;border-radius:20px;background:#E0F0F2;color:#0F7C8A;white-space:nowrap}
+.role-badge.r-super{background:#FBEAD2;color:#c9760a}.role-badge.r-finance{background:#E3EAF7;color:#3a5ba0}.role-badge.r-warehouse{background:#E2F3EC;color:#2FA37A}
+.self-tag{font-size:11px;color:#0F7C8A;font-weight:600}.off-tag{font-size:11px;color:#c0392b;font-weight:600}
+.admin-list{display:flex;flex-direction:column;gap:12px}
+.admin-card{background:#fff;border:1px solid #E6E2D8;border-radius:14px;padding:15px}.admin-card.off{opacity:.6}
+.ac-head{display:flex;flex-direction:column;gap:5px}
+.ac-id{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.ac-id b{font-size:16px}
+.ac-email{font-size:13px;color:#8a9699}.ac-actions{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
+.form-box{background:#F8FAFA;border:1px solid #E0EAEA;border-radius:13px;padding:16px;margin-top:14px}
+.role-pick{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:6px 0 12px}
+.chip-btn{border:1.5px solid #DCD9CF;background:#fff;border-radius:20px;padding:7px 14px;font-size:13px;font-weight:600;color:#3a4a4e;font-family:inherit;cursor:pointer}
+.chip-btn.on{background:#0F7C8A;border-color:#0F7C8A;color:#fff}.chip-btn:disabled{opacity:.5}
+.perm-groups{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:6px 0}.perm-groups.dim{opacity:.55}
+.perm-group{background:#fff;border:1px solid #E6E2D8;border-radius:11px;padding:12px}
+.perm-g-title{font-weight:700;font-size:13px;margin-bottom:8px}
+.perm-row{display:flex;align-items:center;gap:9px;padding:5px 0;font-size:13.5px;color:#3a4a4e}
+.perm-row input{width:17px;height:17px;accent-color:#0F7C8A}
+.form-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:12px}
+.shelf-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px}
+.shelf-card{background:#fff;border:1px solid #E6E2D8;border-radius:12px;padding:13px;display:flex;justify-content:space-between;align-items:flex-start}
+.shelf-card b{font-family:'Space Grotesk';font-size:18px}
+.x{border:0;background:0;color:#cdd5d5;font-size:14px;cursor:pointer}
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#0E2A33;color:#fff;padding:11px 20px;border-radius:24px;font-size:14px;box-shadow:0 10px 24px rgba(0,0,0,.3);z-index:50}
+@media(max-width:760px){.body{flex-direction:column}.side{width:100%;display:flex;gap:6px;overflow-x:auto;padding:10px}.nav{width:auto;white-space:nowrap;margin:0}.soon-tag{display:none}.form-grid,.form-grid2{grid-template-columns:1fr}.perm-groups{grid-template-columns:1fr}.settings-grid{grid-template-columns:1fr}.qr-grid2{grid-template-columns:1fr}}
+
+/* finance / pack / settings */
+.order .order-h{display:flex;justify-content:space-between;align-items:center}
+.order .order-h .mono{font-size:15px;font-weight:700}
+.order-pay{display:flex;justify-content:space-between;align-items:center;margin:8px 0;padding-top:8px;border-top:1px solid #EEE}
+.order-pay b{font-size:17px;color:#c9760a}
+.shot{width:100%;max-width:240px;border-radius:10px;margin:8px 0;display:block;border:1px solid #E6E2D8}
+.recipient-snap{background:#F6F4EE;border-radius:10px;padding:10px 12px;margin:8px 0;font-size:13px;line-height:1.6}
+.recipient-snap b{display:block;margin-bottom:4px;font-size:12.5px;color:#5a6a6e}
+.pack-items{margin:8px 0}.pack-items b{display:block;margin-bottom:6px;font-size:13px;color:#5a6a6e}
+.batch-row{display:flex;gap:10px;align-items:center;padding:6px 10px;border:1px solid #EEE;border-radius:8px;margin-bottom:4px;flex-wrap:wrap}
+.settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.settings-grid .fld i.suffix{display:block;font-style:normal;font-size:11px;color:#8a9699;margin-top:4px}
+.qr-grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.qr-cell{display:flex;flex-direction:column;align-items:flex-start;gap:10px}
+.qr-up{width:180px;height:auto;border:1px solid #E6E2D8;border-radius:10px}
+.qr-empty{width:180px;height:180px;border:1.5px dashed #cdd5d5;border-radius:10px;display:flex;align-items:center;justify-content:center;color:#8a9699;font-size:13px}
+
+/* overview / finance summary cards */
+.ov-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:12px 0 18px}
+.finance-today{margin-bottom:18px}
+.ov-card{background:#fff;border:1px solid #E6E2D8;border-radius:14px;padding:14px;text-align:left}
+.ov-card.clickable{cursor:pointer;font-family:inherit;width:100%;display:block;transition:transform .12s ease,box-shadow .12s ease,border-color .12s ease}
+.ov-card.clickable:hover{transform:translateY(-2px);box-shadow:0 8px 20px rgba(15,124,138,.12);border-color:#0F7C8A}
+.ov-card.clickable:active{transform:translateY(0)}
+.ov-card.noclick{opacity:.6;cursor:not-allowed}
+.ov-card .ov-go{display:block;margin-top:8px;font-style:normal;font-size:11.5px;color:#0F7C8A;font-weight:600}
+.ov-card.warn .ov-go{color:#D9534F}
+.ov-card.leaf .ov-go{color:#2FA37A}
+.ov-card.gold .ov-go{color:#c9760a}
+.ov-card.sea .ov-go{color:#0F7C8A}
+.ov-card span{font-size:12.5px;color:#5a6a6e;display:block}
+.ov-card b{font-family:'Space Grotesk';font-size:28px;color:#0E2A33;display:block;margin:4px 0}
+.ov-card i{font-style:normal;font-size:11.5px;color:#8a9699}
+.ov-card.sea b{color:#0F7C8A}
+.ov-card.leaf b{color:#2FA37A}
+.ov-card.warn b{color:#D9534F}
+.ov-card.gold b{color:#c9760a}
+@media(max-width:760px){.ov-grid{grid-template-columns:repeat(2,1fr)}}
+
+/* scanner frame & line */
+.scan-frame{position:relative;width:100%;max-width:380px;border-radius:14px;overflow:hidden;background:#000;aspect-ratio:4/3;margin-bottom:8px}
+.scan-frame video{width:100%;height:100%;object-fit:cover}
+.scan-line{position:absolute;left:8%;right:8%;top:50%;height:2px;background:linear-gradient(90deg,transparent,#F4A23C,transparent);animation:scanline 1.6s linear infinite;box-shadow:0 0 10px #F4A23C}
+.scan-close{position:absolute;top:10px;right:10px;width:36px;height:36px;border-radius:50%;border:0;background:rgba(0,0,0,.55);color:#fff;font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(4px);font-weight:700;z-index:5}
+.scan-close:active{background:rgba(0,0,0,.75)}
+@keyframes scanline{0%{top:18%}50%{top:82%}100%{top:18%}}
+.scan-info{font-size:12.5px;color:#0F7C8A;background:#EAF4F5;border-radius:9px;padding:8px 12px;margin-bottom:8px;font-weight:600}
+
+/* 倉庫作業：手機使用頻繁，按鈕／輸入加大 */
+.wh-wrap .subtab{padding:11px 22px;font-size:15px;border-radius:24px}
+.wh-wrap .btn{padding:14px 18px;font-size:16px;border-radius:13px;min-height:50px}
+.wh-wrap .btn.tiny{padding:10px 14px;font-size:14px;min-height:auto}
+.wh-wrap .btn.block{min-height:56px;font-size:17px;padding:16px 18px;font-weight:700}
+.wh-wrap .fld input{padding:14px 14px;font-size:17px;min-height:54px;border-radius:12px}
+.wh-wrap .fld span,.wh-wrap .fld-label{font-size:14px}
+.wh-wrap .coupon-row input{padding:14px 14px;font-size:17px;min-height:54px}
+.wh-wrap .upload{height:160px;font-size:16px}
+.wh-wrap .scan-frame{max-width:100%}
+.wh-wrap .weigh-h{font-size:17px}
+
+/* 訂單列表摘要 */
+.ord-sum{background:#FFF8EF;border:1px dashed #F4A23C;color:#8a5a12;border-radius:10px;padding:10px 14px;font-size:13px;margin:8px 0 12px;font-weight:600}
+.ord-sum b{color:#c9760a;font-size:15px}
+
+/* 邀請好友列 / 積分流水 */
+.invitee-row{display:flex;align-items:center;gap:14px}
+.invitee-row .avatar{width:42px;height:42px;font-size:18px;border-radius:11px;flex-shrink:0}
+.invitee-row .m-main{flex:1;min-width:0}
+.invitee-pts{font-family:'Space Grotesk';font-size:20px;font-weight:700;color:#2FA37A;text-align:right;flex-shrink:0}
+.invitee-pts i{display:block;font-style:normal;font-size:11px;color:#8a9699;font-weight:500}
+.pt-row{display:flex;align-items:center;gap:14px;justify-content:space-between}
+.pt-delta{font-family:'Space Grotesk';font-size:22px;font-weight:700;flex-shrink:0}
+.pt-delta.in{color:#2FA37A}
+.pt-delta.out{color:#D9534F}
+
+/* 優惠券用量條 */
+.coupon-bar-row{margin:8px 0 4px}
+.coupon-bar{height:6px;background:#EEF1F0;border-radius:3px;overflow:hidden;margin-bottom:5px}
+.coupon-bar i{display:block;height:100%;background:linear-gradient(90deg,#0F7C8A,#F4A23C);transition:width .3s ease}
+.coupon-bar-text{font-size:12px;color:#5a6a6e}
+.coupon-bar-text b{color:#0E2A33;font-size:13px}
+
+/* 物流單號輸入＋掃描按鈕 */
+.track-input-row{display:flex;gap:8px;align-items:stretch;flex-wrap:wrap}
+.track-input-row input{flex:1;min-width:140px}
+.scan-btn{flex-shrink:0;white-space:nowrap}
+
+/* 二選一切換（如：新竹物流／黑貓宅急便） */
+.seg{display:flex;gap:10px;flex-wrap:wrap}
+.seg button{flex:1;min-width:120px;padding:12px 16px;border:1.5px solid #DCD9CF;background:#fff;border-radius:11px;font-size:15px;font-weight:600;color:#3a4a4e;font-family:inherit;cursor:pointer;transition:all .15s ease}
+.seg button:hover{border-color:#0F7C8A;color:#0F7C8A}
+.seg button.on{background:#0F7C8A;border-color:#0F7C8A;color:#fff;box-shadow:0 2px 8px rgba(15,124,138,.25)}
+
+/* members */
+.member-row{display:flex;align-items:center;gap:14px;justify-content:space-between;flex-wrap:wrap}
+.m-main{flex:1;min-width:240px}
+.m-meta{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:#5a6a6e;margin-top:6px}
+.m-meta b{color:#0E2A33}
+.avatar{width:46px;height:46px;border-radius:13px;background:#0F7C8A;color:#fff;display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:700;font-family:'Space Grotesk';flex-shrink:0}
+.avatar.lg{width:60px;height:60px;font-size:28px;border-radius:16px}
+.member-summary .ms-head{display:flex;align-items:center;gap:14px;margin-bottom:14px}
+.ms-info{flex:1;min-width:0}
+.ms-name{display:flex;align-items:center;gap:8px}
+.ms-name b{font-family:'Space Grotesk';font-size:19px}
+.member-stats{margin:0}
+.page-head .btn{flex-shrink:0}
+
+/* ── 登入頁雙模式 ── */
+.login-tabs{display:flex;background:#F5F6F4;border-radius:11px;padding:4px;margin-bottom:18px;gap:4px}
+.login-tabs button{flex:1;border:0;background:transparent;padding:9px 14px;border-radius:8px;
+  font-size:14px;font-weight:600;color:#5a6a6e;cursor:pointer;font-family:inherit;transition:all .15s}
+.login-tabs button.on{background:#fff;color:#0E2A33;box-shadow:0 2px 8px rgba(0,0,0,.1)}
+.login-hint{font-size:12px;color:#9aa6a9;line-height:1.6;margin-top:6px}
+
+/* ── 業務員模式 banner ── */
+.sp-mode .topbar{background:linear-gradient(90deg,#1B3A6B,#2d5fa8)}
+.sp-bar{background:linear-gradient(90deg,#1B3A6B,#2d5fa8) !important}
+.brand-mark.sp{background:linear-gradient(135deg,#F5A623,#e8911a) !important}
+.sp-banner{background:#FFF8EF;border-bottom:2px solid #F5A623;padding:8px 20px;
+  font-size:13px;color:#92400E;font-weight:600;text-align:center}
+.sp-role{background:rgba(245,166,35,.2) !important;color:#F5A623 !important}
+
+/* ── 業務員管理列表 ── */
+.page-h-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:10px}
+.sp-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px}
+.sp-card{background:#fff;border:1.5px solid #E0E3E0;border-radius:14px;padding:16px;
+  transition:box-shadow .15s}
+.sp-card:hover{box-shadow:0 4px 16px rgba(0,0,0,.1)}
+.sp-card.disabled{opacity:.6;background:#f9f9f9}
+.sp-card-h{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:10px}
+.sp-name{font-family:'Space Grotesk';font-size:17px;font-weight:700;color:#0E2A33;cursor:pointer}
+.sp-name:hover{color:#0F7C8A;text-decoration:underline}
+.sp-tag-off{background:#FEE2E2;color:#B91C1C;border-radius:6px;padding:2px 7px;font-size:11px;font-weight:600;margin-left:6px}
+.sp-user{font-size:12px;color:#9aa6a9;margin-top:2px}
+.sp-card-actions{display:flex;gap:6px;flex-shrink:0}
+.sp-stats{display:flex;gap:14px;background:#F5F6F4;border-radius:10px;padding:10px 12px;margin-bottom:10px}
+.sp-stat{text-align:center;flex:1}
+.sp-stat b{display:block;font-family:'Space Grotesk';font-size:20px;font-weight:700;color:#0E2A33}
+.sp-stat span{font-size:11px;color:#5a6a6e}
+.sp-promo{margin-bottom:8px}
+.sp-promo-url{display:flex;align-items:center;gap:8px;background:#EEF2FF;border-radius:8px;
+  padding:7px 10px;margin-top:3px;cursor:pointer;transition:background .12s}
+.sp-promo-url:hover{background:#E0E8FF}
+.sp-promo-url span{flex:1;font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#1B3A6B}
+.sp-rate-badge{display:inline-block;background:#ECFDF5;color:#065F46;border-radius:6px;
+  padding:3px 9px;font-size:11px;font-weight:600;margin-bottom:6px}
+.sp-contacts{display:flex;gap:10px;flex-wrap:wrap;color:#5a6a6e;margin-top:4px}
+.sp-contacts span{font-size:12px}
+
+/* ── 表單佈局 ── */
+.form-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px}
+.sec{font-family:'Space Grotesk';font-size:14px;font-weight:700;color:#0E2A33;
+  margin:0 0 12px;padding-bottom:8px;border-bottom:1.5px solid #E0E3E0;
+  text-transform:uppercase;letter-spacing:.4px}
+.switch-row{display:flex;align-items:center;gap:8px}
+.form-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:18px;padding-top:14px;border-top:1px solid #E0E3E0}
+
+/* ── 統計卡列 ── */
+.stats-row{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:6px}
+.stat-card{flex:1;min-width:130px;background:#fff;border:1.5px solid #E0E3E0;border-radius:12px;
+  padding:14px 16px;text-align:center}
+.stat-card b{display:block;font-family:'Space Grotesk';font-size:22px;font-weight:700;color:#0E2A33;margin-bottom:4px}
+.stat-card span{font-size:12px;color:#5a6a6e}
+.stat-card.highlight{border-color:#F5A623;background:#FFFBF0}
+.stat-card.highlight b{color:#c97800}
+
+/* ── 資料表 ── */
+.tbl{width:100%;border-collapse:collapse;font-size:13.5px}
+.tbl th{background:#F5F6F4;color:#5a6a6e;font-weight:600;padding:9px 12px;
+  text-align:left;font-size:12px;letter-spacing:.3px;border-bottom:1.5px solid #E0E3E0}
+.tbl td{padding:9px 12px;border-bottom:1px solid #F0F0EF;color:#0E2A33;vertical-align:top}
+.tbl tr:hover td{background:#FAFAFA}
+.tbl tr:last-child td{border-bottom:0}
+
+/* ── 業務員推廣頁 ── */
+.promo-url-box{background:#EEF2FF;border-radius:11px;padding:14px;display:flex;
+  flex-direction:column;gap:10px}
+.promo-url{font-size:13px;color:#1B3A6B;word-break:break-all;line-height:1.5}
+.promo-code-display{display:flex;align-items:center;gap:12px;padding:12px 14px;
+  background:#F5F6F4;border-radius:10px;font-size:18px;font-weight:700}
+.qr-wrap{display:flex;flex-direction:column;align-items:center;gap:10px;padding:10px 0}
+.qr-img{width:200px;height:200px;border-radius:12px;border:1px solid #E0E3E0}
+
+/* ── 業務員指派框 ── */
+.assign-sp-box{background:#F0F4FF;border:1px solid #C7D4EE;border-radius:10px;
+  padding:12px 14px;margin-top:12px}
+.assign-sp-label{font-size:12px;font-weight:600;color:#374151;margin-bottom:7px;
+  letter-spacing:.3px;text-transform:uppercase}
+.assign-sp-row{display:flex;gap:9px;align-items:center;flex-wrap:wrap}
+.assign-sp-select{flex:1;min-width:200px;border:1.5px solid #BFCBDD;border-radius:9px;
+  padding:8px 10px;font-size:14px;font-family:inherit;color:#0E2A33;background:#fff;outline:none}
+.assign-sp-select:focus{border-color:#1B3A6B}
+
+/* ── 空狀態 ── */
+.empty{text-align:center;color:#9aa6a9;font-size:13.5px;padding:44px 18px;
+  border:1.5px dashed #DCD9CF;border-radius:12px;line-height:1.9}
+.empty.big{padding:64px 18px}
+
+/* ── 業務員支付寶收款碼（詳情頁顯示） ── */
+.sp-alipay-card{background:#EFF6FF;border:1.5px solid #BFDBFE;border-radius:14px;
+  padding:16px;display:flex;flex-direction:column;align-items:center;gap:10px;margin-bottom:14px}
+.sp-alipay-label{font-size:13px;font-weight:700;color:#1e40af}
+.sp-alipay-qr{width:180px;height:180px;border-radius:10px;object-fit:contain;
+  border:1px solid #DBEAFE;background:#fff}
+
+/* ── 結算操作 ── */
+.badge-count{background:#E03E3E;color:#fff;border-radius:10px;padding:1px 7px;font-size:11px;font-weight:700;margin-left:6px}
+.settle-info{background:linear-gradient(135deg,#1B3A6B,#2d5fa8);color:#fff;border-radius:14px;padding:18px 20px;text-align:center;margin:14px 0 10px}
+.settle-title{font-size:13px;opacity:.8;margin-bottom:4px}
+.settle-amount{font-family:'Space Grotesk';font-size:32px;font-weight:700;color:#F5A623}
+.settle-count{font-size:12px;opacity:.75;margin-top:4px}
+.settle-sel-row{display:flex;align-items:center;gap:10px;margin:10px 0;flex-wrap:wrap}
+.settle-sel-hint{font-size:13px;color:#1B3A6B;font-weight:600}
+.row-selected td{background:#EFF6FF !important}
+.settle-action-card{background:#fff;border:2px solid #1B3A6B;border-radius:14px;padding:18px;margin-top:14px}
+.settle-action-title{font-family:'Space Grotesk';font-size:16px;font-weight:700;color:#1B3A6B;margin-bottom:14px}
+.settle-step{display:flex;gap:12px;align-items:flex-start;margin-bottom:14px;padding-bottom:14px;border-bottom:1px dashed #E0E3E0}
+.settle-step:last-of-type{border-bottom:0;margin-bottom:0;padding-bottom:0}
+.settle-step-num{width:28px;height:28px;border-radius:50%;background:#1B3A6B;color:#fff;
+  display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;flex-shrink:0;margin-top:1px}
+.settle-upload{display:flex;align-items:center;justify-content:center;border:2px dashed #DADEEA;
+  border-radius:10px;height:90px;margin-top:8px;color:#9aa6a9;font-size:14px;
+  cursor:pointer;background:#FAFAFA;transition:border .12s;overflow:hidden}
+.settle-upload:active{border-color:#1B3A6B}
+.settle-proof-preview{width:100%;height:100%;object-fit:contain}
+.settle-note{width:100%;border:1.5px solid #DCD9CF;border-radius:9px;padding:9px 11px;
+  font-size:14px;font-family:inherit;margin-top:7px;outline:none}
+.settle-note:focus{border-color:#1B3A6B}
+
+/* ── 業務員個人設定：支付寶上傳區 ── */
+.alipay-upload-box{background:#EFF6FF;border:1.5px solid #BFDBFE;border-radius:12px;
+  padding:14px;display:flex;flex-direction:column;align-items:center;gap:10px}
+.alipay-preview-wrap{display:flex;flex-direction:column;align-items:center;gap:6px}
+.alipay-preview{width:160px;height:160px;border-radius:10px;object-fit:contain;
+  border:1px solid #DBEAFE;background:#fff}
+.alipay-preview-label{font-size:12.5px;color:#065F46;font-weight:600}
+.alipay-empty{color:#9aa6a9;font-size:13.5px;padding:18px}
+.alipay-upload-btn{background:#1B3A6B;color:#fff;border:0;border-radius:9px;
+  padding:9px 18px;font-size:13.5px;font-weight:600;cursor:pointer;font-family:inherit}
+.alipay-upload-btn:active{background:#2d5fa8}
+
+/* ── 統計 / 日期篩選 ── */
+.drp{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:14px}
+.drp-presets{display:flex;gap:6px;flex-wrap:wrap}
+.drp-btn{border:1.5px solid #DCD9CF;background:#fff;color:#374151;border-radius:20px;
+  padding:6px 14px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;
+  transition:all .12s;white-space:nowrap}
+.drp-btn:hover{border-color:#1B3A6B;color:#1B3A6B}
+.drp-btn.on{background:#1B3A6B;border-color:#1B3A6B;color:#fff}
+.drp-custom{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.drp-custom input{border:1.5px solid #DCD9CF;border-radius:9px;padding:7px 10px;
+  font-size:13px;font-family:inherit;outline:none;color:#0E2A33}
+.drp-custom input:focus{border-color:#1B3A6B}
+.drp-range{font-size:12px;color:#9aa6a9}
+.stats-filters{display:flex;flex-wrap:wrap;align-items:flex-start;gap:12px;margin-bottom:16px;
+  background:#F5F6F4;border-radius:12px;padding:12px 16px}
+.stats-sp-select{border:1.5px solid #DCD9CF;border-radius:9px;padding:7px 10px;
+  font-size:13px;font-family:inherit;color:#0E2A33;background:#fff;outline:none}
+.stats-sp-select:focus{border-color:#1B3A6B}
+
+/* ── KPI 卡片 ── */
+.kpi-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px}
+.kpi-card{background:#fff;border:1.5px solid #E0E3E0;border-radius:12px;padding:14px 16px}
+.kpi-card.highlight{border-color:#F5A623;background:#FFFBF0}
+.kpi-label{font-size:12px;color:#5a6a6e;margin-bottom:6px;font-weight:600;letter-spacing:.2px;text-transform:uppercase}
+.kpi-value{font-family:'Space Grotesk';font-size:22px;font-weight:700;color:#0E2A33;margin-bottom:2px}
+.kpi-card.highlight .kpi-value{color:#c97800}
+.kpi-sub{font-size:11.5px;color:#9aa6a9;margin-bottom:4px}
+.kpi-trend{display:flex;align-items:center;gap:6px;margin-top:4px}
+.kpi-prev{font-size:11px;color:#9aa6a9}
+.trend-badge{font-size:11.5px;font-weight:700;padding:2px 7px;border-radius:12px}
+.trend-badge.up{background:#D1FAE5;color:#065F46}
+.trend-badge.down{background:#FEE2E2;color:#B91C1C}
+.trend-na{color:#9aa6a9;font-size:12px}
+
+/* ── 折線圖 ── */
+.chart-wrap{overflow-x:auto}
+.chart-empty{text-align:center;color:#9aa6a9;padding:28px;font-size:13px}
+.chart-label{font-size:12.5px;font-weight:600;color:#5a6a6e;margin-bottom:8px;text-transform:uppercase;letter-spacing:.3px}
+.chart-ctrl{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:8px}
+.chart-ctrl-title{font-size:14px;font-weight:700;color:#0E2A33}
+.chart-ctrl-tabs{display:flex;gap:4px;flex-wrap:wrap}
+.chart-tab{border:1.5px solid #DCD9CF;background:#fff;color:#5a6a6e;border-radius:8px;
+  padding:5px 10px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit}
+.chart-tab.on{background:#1B3A6B;border-color:#1B3A6B;color:#fff}
+.tbl-head-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.tbl-total td{background:#F5F6F4;font-weight:700;border-top:2px solid #DCD9CF !important}
+
+/* ── 總覽擴充 ── */
+.ov-section-title{display:flex;justify-content:space-between;align-items:center;
+  margin:24px 0 12px;padding-top:16px;border-top:1.5px solid #E0E3E0}
+.ov-section-title span:first-child{font-family:'Space Grotesk';font-size:16px;font-weight:700;color:#0E2A33}
+.ov-section-hint{font-size:12px;color:#9aa6a9}
+.rank-tabs{display:flex;gap:4px}
+.rank-tab{border:1.5px solid #DCD9CF;background:#fff;color:#5a6a6e;border-radius:8px;
+  padding:5px 10px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit}
+.rank-tab.on{background:#1B3A6B;border-color:#1B3A6B;color:#fff}
+.rank-bar-wrap{display:flex;align-items:center;gap:6px;min-width:80px}
+.rank-bar{height:8px;border-radius:4px;background:linear-gradient(90deg,#1B3A6B,#F5A623);min-width:2px;transition:width .4s ease}
+.rank-bar-wrap span{font-size:11.5px;color:#5a6a6e;white-space:nowrap}
+.organic-row td{background:#FFFBF0 !important}
+.sp-name-tag{font-weight:600;font-size:13px}
+.sp-name-tag.organic{color:#c97800}
+
+/* ── 業務員後台篩選 ── */
+.sp-filter-bar{display:flex;flex-wrap:wrap;align-items:flex-start;gap:8px;
+  margin-bottom:14px;padding:10px 14px;background:#F5F6F4;border-radius:10px}
+`;
+
+
+
+const _root = ReactDOM.createRoot(document.getElementById("root"));
+_root.render(<App />);
+
+</script></body></html>
