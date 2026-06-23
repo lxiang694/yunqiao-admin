@@ -1332,6 +1332,13 @@ function RecipientInfo({ o }) {
   );
 }
 
+// 取貨付款（運費到付）：後端建單時 payment_method 一律為 "pickup"，以此為準最可靠
+const isCod = (o) => !!o && o.payment_method === "pickup";
+function CodTag({ o }) {
+  if (!isCod(o)) return null;
+  return <span className="cod-tag">💰 運費到付</span>;
+}
+
 function PaymentReview({ session, flash, onChange }) {
   const { token } = session;
   const [list, setList] = useState(null);
@@ -1364,10 +1371,10 @@ function PaymentReview({ session, flash, onChange }) {
   return (
     <div className="admin-list">
       {list.map((o) => {
-        const is711cod = o.delivery_type === "711" && !o.payment_screenshot_url;
+        const is711cod = isCod(o);
         return (
         <div className="card order" key={o.id}>
-          <div className="order-h"><span className="mono">{o.order_no}</span><span className="chip chip-grey">待確認付款</span></div>
+          <div className="order-h"><span className="mono">{o.order_no}</span><span className="order-h-tags"><CodTag o={o} /><span className="chip chip-grey">待確認付款</span></span></div>
           <div className="small">{o._user?.username || "—"} · {o._user?.country_code?.replace("-CA","")} {o._user?.phone} · {o.delivery_type === "home" ? "宅配" : "7-11"} · {o.total_weight}kg</div>
           <RecipientInfo o={o} />
           <div className="order-pay"><span>{is711cod ? "7-11 到店代收運費" : "應收 / 已上傳付款方式"}</span><b className="mono">{o.currency === "TWD" ? "NT$" : "¥"}{o.freight_amount}{is711cod ? " · 取貨付款" : ` · ${o.payment_method}`}</b></div>
@@ -1455,7 +1462,7 @@ function OrdersList({ session, flash, initialFilter }) {
         <div className="admin-list">
           {list.map((o) => (
             <div className="card order" key={o.id}>
-              <div className="order-h"><span className="mono">{o.order_no}</span><span className="chip chip-grey">{LBL[o.status] || o.status}</span></div>
+              <div className="order-h"><span className="mono">{o.order_no}</span><span className="order-h-tags"><CodTag o={o} /><span className="chip chip-grey">{LBL[o.status] || o.status}</span></span></div>
               <div className="small">{o._user?.username || "—"} · {o._user?.phone || "—"} · {o.delivery_type === "home" ? "宅配" : "7-11"} · {o.total_weight}kg · {new Date(o.created_at).toLocaleString("zh-TW")}</div>
               <RecipientInfo o={o} />
               <div className="order-pay"><span>金額</span><b className="mono">{o.currency === "TWD" ? "NT$" : "¥"}{o.freight_amount}</b></div>
@@ -1609,7 +1616,7 @@ function PackOps({ session, flash }) {
                       <span className="pack-badge free-badge">⬜ 待認領</span>
                     )}
                   </div>
-                  <span className="chip chip-sea">打包中</span>
+                  <span className="order-h-tags"><CodTag o={o} /><span className="chip chip-sea">打包中</span></span>
                 </div>
 
                 {/* 客戶與收件資訊 */}
@@ -2172,7 +2179,7 @@ function MemberDetail({ token, userId, onBack, flash }) {
           <div className="admin-list">
             {arr.map((s) => (
               <div className="card order" key={s.id}>
-                <div className="order-h"><span className="mono">{s.order_no}</span><span className="chip chip-grey">{SHIP_LBL[s.status] || s.status}</span></div>
+                <div className="order-h"><span className="mono">{s.order_no}</span><span className="order-h-tags"><CodTag o={s} /><span className="chip chip-grey">{SHIP_LBL[s.status] || s.status}</span></span></div>
                 <div className="small">{new Date(s.created_at).toLocaleString("zh-TW")} · {s.delivery_type === "home" ? "宅配到府" : "7-11 取貨"} · {s.total_weight}kg</div>
                 {s.recipient_snapshot && (
                   <div className="recipient-snap">
@@ -2792,7 +2799,7 @@ function SalespersonDetail({ token, sp, onBack, flash }) {
               <table className="tbl">
                 <thead><tr><th>單號</th><th>方式</th><th>狀態</th><th>金額</th><th>時間</th></tr></thead>
                 <tbody>{shipments.slice(0, 50).map(s => (
-                  <tr key={s.id}><td className="mono">{s.order_no}</td><td>{s.delivery_type === "home" ? "宅配" : "7-11"}</td><td>{s.status}</td><td>{s.currency === "RMB" ? "¥" : "NT$"}{s.freight_amount}</td><td className="sm">{new Date(s.created_at).toLocaleDateString()}</td></tr>
+                  <tr key={s.id}><td className="mono">{s.order_no}</td><td>{s.delivery_type === "home" ? "宅配" : "7-11"}{isCod(s) ? " · 到付" : ""}</td><td>{s.status}</td><td>{s.currency === "RMB" ? "¥" : "NT$"}{s.freight_amount}</td><td className="sm">{new Date(s.created_at).toLocaleDateString()}</td></tr>
                 ))}</tbody>
               </table>
             )}
@@ -3136,7 +3143,7 @@ function SpOrders({ data }) {
             <tbody>{ships.map(s => (
               <tr key={s.id}>
                 <td className="mono">{s.order_no}</td>
-                <td>{s.delivery_type === "home" ? "宅配" : "7-11"}</td>
+                <td>{s.delivery_type === "home" ? "宅配" : "7-11"}{isCod(s) ? " · 到付" : ""}</td>
                 <td>{s.status}</td>
                 <td>{s.total_weight}kg</td>
                 <td>{s.currency === "RMB" ? "¥" : "NT$"}{s.freight_amount}</td>
@@ -3540,7 +3547,10 @@ const CSS = `
 @media(max-width:760px){.body{flex-direction:column}.side{width:100%;display:flex;gap:6px;overflow-x:auto;padding:10px}.nav{width:auto;white-space:nowrap;margin:0}.soon-tag{display:none}.form-grid,.form-grid2{grid-template-columns:1fr}.perm-groups{grid-template-columns:1fr}.settings-grid{grid-template-columns:1fr}.qr-grid2{grid-template-columns:1fr}}
 
 /* finance / pack / settings */
-.order .order-h{display:flex;justify-content:space-between;align-items:center}
+.order .order-h{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.order-h-tags{display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.cod-tag{display:inline-flex;align-items:center;gap:3px;background:#FFF1E6;color:#C2410C;
+  border:1px solid #FED7AA;border-radius:999px;padding:2px 9px;font-size:11.5px;font-weight:700;white-space:nowrap}
 .order .order-h .mono{font-size:15px;font-weight:700}
 .order-pay{display:flex;justify-content:space-between;align-items:center;margin:8px 0;padding-top:8px;border-top:1px solid #EEE}
 .order-pay b{font-size:17px;color:#c9760a}
