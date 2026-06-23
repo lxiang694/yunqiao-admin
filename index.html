@@ -85,6 +85,36 @@ async function uploadPkgPhoto(file, token) {
 }
 
 // ZXing：iOS Safari/Chrome 沒有原生 BarcodeDetector，必須靠 ZXing 解碼。
+// SheetJS（xlsx）延遲載入：多 CDN 並行，產生物流面單匯入檔用
+let __xlsxPromise = null;
+function ensureXLSX(timeoutMs = 12000) {
+  if (typeof window === "undefined") return Promise.resolve(false);
+  if (window.XLSX) return Promise.resolve(true);
+  if (__xlsxPromise) return __xlsxPromise;
+  const urls = [
+    "https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js",
+    "https://fastly.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js",
+    "https://gcore.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js",
+    "https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js",
+    "https://npm.elemecdn.com/xlsx@0.18.5/dist/xlsx.full.min.js",
+    "https://cdn.staticfile.org/xlsx/0.18.5/xlsx.full.min.js",
+    "https://lib.baomitu.com/xlsx/0.18.5/xlsx.full.min.js",
+  ];
+  __xlsxPromise = new Promise((res) => {
+    let done = false;
+    const finish = (ok) => { if (done) return; done = true; res(ok); if (!ok) __xlsxPromise = null; };
+    urls.forEach((url) => {
+      const s = document.createElement("script");
+      s.src = url; s.async = true; s.crossOrigin = "anonymous";
+      s.onload = () => { if (window.XLSX) finish(true); };
+      s.onerror = () => {};
+      document.head.appendChild(s);
+    });
+    setTimeout(() => finish(!!window.XLSX), timeoutMs);
+  });
+  return __xlsxPromise;
+}
+
 // 多 CDN 並行嘗試（哪個先到用哪個），含中國／亞太友善鏡像；總超時 10 秒。
 let __zxingPromise = null;
 function ensureZXing(timeoutMs = 10000) {
@@ -428,6 +458,49 @@ function LineChart({ data, keyX, keyY, label, color = "#1B3A6B", height = 160 })
   );
 }
 
+// 物流面單匯入檔匯出（38 欄模板，承运商分流 7-11／新竹）
+const LOGI_HEADERS = ["订单号","运单号","SKU","发件人税号","税号类型","备注","货物类型","货物数量","品名","目的地","时效","承运商","代收货款","保价金额","包税(1包税2不包税)","身份证号码","邮编编码","收件人地址","收件人手机","收件人电话","收件人姓名","申报数量","申报价值","申报单价","保险费","件数","派件人名","派件人电话","英文品名","门店名称","门店号码","省","市","区","备用1","备用2","备用3","备用4"];
+
+function logiRow(o) {
+  const is711 = o.delivery_type === "711";
+  const snap = o.recipient_snapshot || {};
+  const carrier = is711 ? "7-11" : (o.return_carrier === "黑貓宅急便" ? "黑貓" : "新竹");
+  const cod = is711 ? (o.freight_amount ?? 0) : 0;
+  const qty = (o._items && o._items.length) || 1;
+  const addr = is711 ? (snap.store_addr || "") : (snap.detail || "");
+  const phone = snap.phone || "";
+  return {
+    "订单号": o.order_no || "", "运单号": "", "SKU": "", "发件人税号": "", "税号类型": "", "备注": "",
+    "货物类型": "普货", "货物数量": qty, "品名": "保健品", "目的地": "中国台湾", "时效": "空运",
+    "承运商": carrier, "代收货款": cod, "保价金额": "", "包税(1包税2不包税)": "1",
+    "身份证号码": "", "邮编编码": "", "收件人地址": addr, "收件人手机": phone, "收件人电话": phone,
+    "收件人姓名": snap.receiver_name || "", "申报数量": "", "申报价值": "", "申报单价": "", "保险费": "",
+    "件数": qty, "派件人名": "", "派件人电话": "", "英文品名": "Health Supplement",
+    "门店名称": is711 ? (snap.store_name || "") : "", "门店号码": "", "省": "", "市": "", "区": "",
+    "备用1": "", "备用2": "", "备用3": "", "备用4": "",
+  };
+}
+
+async function exportLogisticsXlsx(list, flash) {
+  const rows = (list || []).map(logiRow);
+  if (!rows.length) { flash && flash("目前沒有可導出的訂單"); return; }
+  const ok = await ensureXLSX();
+  const ts = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  const fname = `物流面單_${ts.getFullYear()}${pad(ts.getMonth()+1)}${pad(ts.getDate())}_${pad(ts.getHours())}${pad(ts.getMinutes())}`;
+  if (ok && window.XLSX) {
+    const aoa = [LOGI_HEADERS, ...rows.map(r => LOGI_HEADERS.map(h => r[h]))];
+    const ws = window.XLSX.utils.aoa_to_sheet(aoa);
+    const wb = window.XLSX.utils.book_new();
+    window.XLSX.utils.book_append_sheet(wb, ws, "面單");
+    window.XLSX.writeFile(wb, fname + ".xlsx");
+  } else {
+    // CDN 全部失敗時退回 CSV（Excel 可開，平台多半也接受）
+    exportCsv(rows, LOGI_HEADERS.map(h => ({ key: h, label: h })), fname + ".csv");
+    flash && flash("xlsx 元件載入失敗，已改用 CSV 匯出");
+  }
+}
+
 // CSV 匯出工具
 function exportCsv(rows, headers, filename) {
   const bom = "\uFEFF"; // Excel 繁體中文 BOM
@@ -531,18 +604,51 @@ function Overview({ me, session, goto, has }) {
 
       {/* 即時狀態卡 */}
       {!st ? <div className="muted">載入中…</div> : (
-        <div className="ov-grid">
-          {cards.map((c, i) => (
-            <button key={i} type="button" disabled={!c.enable}
-              className={"ov-card clickable " + c.color + (c.enable ? "" : " noclick")}
-              onClick={c.enable ? c.goto : undefined}>
-              <span>{c.label}</span>
-              <b>{c.value}</b>
-              <i>{c.hint}</i>
-              {c.enable && <em className="ov-go">{c.hover}</em>}
-            </button>
-          ))}
-        </div>
+        <>
+          <div className="ov-grid">
+            {cards.map((c, i) => (
+              <button key={i} type="button" disabled={!c.enable}
+                className={"ov-card clickable " + c.color + (c.enable ? "" : " noclick")}
+                onClick={c.enable ? c.goto : undefined}>
+                <span>{c.label}</span>
+                <b>{c.value}</b>
+                <i>{c.hint}</i>
+                {c.enable && <em className="ov-go">{c.hover}</em>}
+              </button>
+            ))}
+          </div>
+
+          {/* 打包進度區塊 */}
+          {(st.orders_packing > 0) && (
+            <div className="pack-progress-block">
+              <div className="pack-progress-title">
+                <span>📦 打包進度</span>
+                <span className="pack-progress-meta">
+                  <span className="pp-free">待認領 {st.orders_packing_free}</span>
+                  <span className="pp-locked">認領中 {st.orders_packing_locked}</span>
+                </span>
+              </div>
+              {st.packer_progress && st.packer_progress.length > 0 ? (
+                <div className="pp-list">
+                  {st.packer_progress.map((p, i) => (
+                    <div className="pp-row" key={i}>
+                      <div className="pp-avatar">{(p.packing_by_name || "?")[0]}</div>
+                      <div className="pp-info">
+                        <div className="pp-name">{p.packing_by_name || "未知"}</div>
+                        <div className="pp-time">
+                          認領 {p.locked_count} 張 · 最早認領於 {Math.floor((Date.now() - new Date(p.oldest_lock).getTime()) / 60000)} 分鐘前
+                        </div>
+                      </div>
+                      <div className="pp-count">{p.locked_count} 張</div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="pp-empty">目前無人認領中，共 {st.orders_packing} 張訂單待打包</div>
+              )}
+            </div>
+          )}
+        </>
       )}
 
       {/* ── 本月 vs 上月對比 ── */}
@@ -933,6 +1039,47 @@ function Scanner({ onDetect, onClose }) {
   );
 }
 
+// 入庫時的包裹分組顯示：在倉待處理排前並高亮，已出貨歷史摺疊收起
+function BatchView({ batch, cur, suggest }) {
+  const [showHist, setShowHist] = useState(false);
+  const CHIP = { pending: "chip-grey", arrived: "chip-leaf", packed: "chip-sea", shipped: "chip-grey", abnormal: "chip-alert" };
+  const ACTIVE = ["pending", "arrived", "packed", "abnormal"];
+  const active = batch.filter((b) => ACTIVE.includes(b.status));
+  const shipped = batch.filter((b) => b.status === "shipped");
+  const rank = { pending: 0, arrived: 1, abnormal: 1, packed: 2 };
+  const ordered = [...active].sort((a, b) => {
+    if (a.id === cur.id) return -1;
+    if (b.id === cur.id) return 1;
+    const r = (rank[a.status] ?? 9) - (rank[b.status] ?? 9);
+    return r !== 0 ? r : new Date(a.created_at) - new Date(b.created_at);
+  });
+  const pendingCnt = active.filter((b) => b.status === "pending").length;
+  const Row = (b) => (
+    <div key={b.id} className={"batch-row " + (b.id === cur.id ? "cur " : "") + (b.status === "shipped" ? "done" : "")}>
+      {b.id === cur.id && <span className="cur-tag">本次</span>}
+      <span className="mono small">{b.tracking_no}</span>
+      <span className={"chip " + (CHIP[b.status] || "chip-grey")}>{PKG_LABEL[b.status]}</span>
+      {b.weight != null && <span className="batch-w">{b.weight} kg</span>}
+      {b.shelf_code && <span className="shelf">貨架 {b.shelf_code}</span>}
+    </div>
+  );
+  return (
+    <>
+      <div className="batch-head">在倉待處理 <b>{active.length}</b> 件{pendingCnt > 0 ? `（含 ${pendingCnt} 件待到倉）` : ""}</div>
+      <div className="batch">{ordered.map(Row)}</div>
+      {shipped.length > 0 && (
+        <div className="batch-hist">
+          <button type="button" className="hist-toggle" onClick={() => setShowHist((v) => !v)}>
+            {showHist ? "▾" : "▸"} 已出貨歷史（{shipped.length} 件）
+          </button>
+          {showHist && <div className="batch">{shipped.map(Row)}</div>}
+        </div>
+      )}
+      {suggest && <div className="suggest">📍 此用戶已有包裹在貨架 <b>{suggest}</b>，建議集中放同一貨架</div>}
+    </>
+  );
+}
+
 function Intake({ session, has, flash }) {
   const { token } = session;
   const [tracking, setTracking] = useState("");
@@ -989,17 +1136,7 @@ function Intake({ session, has, flash }) {
         <>
           <div className="card user-card">
             <div className="uc-h"><b>{state.user?.username}</b><span className="mono small">{state.user?.country_code?.replace("-CA","")} {state.user?.phone}</span></div>
-            <div className="small">本批包裹（{state.batch.length} 件）：</div>
-            <div className="batch">
-              {state.batch.map((b) => (
-                <div key={b.id} className={"batch-row " + (b.id === state.pkg.id ? "cur" : "")}>
-                  <span className="mono small">{b.tracking_no}</span>
-                  <span className={"chip " + (b.status === "arrived" ? "chip-leaf" : b.status === "pending" ? "chip-grey" : "chip-sea")}>{PKG_LABEL[b.status]}</span>
-                  {b.shelf_code && <span className="shelf">貨架 {b.shelf_code}</span>}
-                </div>
-              ))}
-            </div>
-            {state.suggest && <div className="suggest">📍 此用戶已有包裹在貨架 <b>{state.suggest}</b>，建議集中放同一貨架</div>}
+            <BatchView batch={state.batch} cur={state.pkg} suggest={state.suggest} />
           </div>
           <WeighForm title="秤重・拍照・上架" pkg={state.pkg} suggest={state.suggest} token={token}
             onDone={() => { flash("已完成上架，用戶可看到重量與照片"); setState(null); setTracking(""); }} />
@@ -1181,6 +1318,20 @@ function FinancePage({ session, has, flash, initialSub, initialFilter }) {
   );
 }
 
+// 收件資訊（宅配地址 / 7-11 門市），財務各列表共用
+function RecipientInfo({ o }) {
+  const s = o.recipient_snapshot || {};
+  const is711 = o.delivery_type === "711";
+  return (
+    <div className="recipient-snap">
+      <b>收件資訊</b>
+      {is711
+        ? <div className="small">7-11 {s.store_name || "—"} 門市<br/>取貨人 {s.receiver_name || "—"} · {s.phone || "—"}{s.store_addr ? <><br/>{s.store_addr}</> : null}</div>
+        : <div className="small">{s.receiver_name || "—"} · {s.phone || "—"}<br/>{s.detail || "—"}</div>}
+    </div>
+  );
+}
+
 function PaymentReview({ session, flash, onChange }) {
   const { token } = session;
   const [list, setList] = useState(null);
@@ -1212,18 +1363,24 @@ function PaymentReview({ session, flash, onChange }) {
   if (!list.length) return <div className="empty big">目前沒有待確認的付款 🎉</div>;
   return (
     <div className="admin-list">
-      {list.map((o) => (
+      {list.map((o) => {
+        const is711cod = o.delivery_type === "711" && !o.payment_screenshot_url;
+        return (
         <div className="card order" key={o.id}>
           <div className="order-h"><span className="mono">{o.order_no}</span><span className="chip chip-grey">待確認付款</span></div>
           <div className="small">{o._user?.username || "—"} · {o._user?.country_code?.replace("-CA","")} {o._user?.phone} · {o.delivery_type === "home" ? "宅配" : "7-11"} · {o.total_weight}kg</div>
-          <div className="order-pay"><span>應收 / 已上傳付款方式</span><b className="mono">{o.currency === "TWD" ? "NT$" : "¥"}{o.freight_amount} · {o.payment_method}</b></div>
-          {o.payment_screenshot_url && (previews[o.id] ? <img className="shot" src={previews[o.id]} alt="截圖" /> : <button className="btn tiny" onClick={() => sign(o.id, o.payment_screenshot_url)}>查看付款截圖</button>)}
+          <RecipientInfo o={o} />
+          <div className="order-pay"><span>{is711cod ? "7-11 到店代收運費" : "應收 / 已上傳付款方式"}</span><b className="mono">{o.currency === "TWD" ? "NT$" : "¥"}{o.freight_amount}{is711cod ? " · 取貨付款" : ` · ${o.payment_method}`}</b></div>
+          {is711cod
+            ? <div className="hint sm">🏪 7-11 取貨付款，運費由超商代收，無需付款截圖。確認訂單即進入打包。</div>
+            : (o.payment_screenshot_url && (previews[o.id] ? <img className="shot" src={previews[o.id]} alt="截圖" /> : <button className="btn tiny" onClick={() => sign(o.id, o.payment_screenshot_url)}>查看付款截圖</button>))}
           <div className="ac-actions">
-            <button className="btn primary tiny" onClick={() => decide(o.id, true)}>✓ 確認收款</button>
-            <button className="btn tiny danger" onClick={() => decide(o.id, false)}>退回（重新付款）</button>
+            <button className="btn primary tiny" onClick={() => decide(o.id, true)}>{is711cod ? "✓ 確認訂單 → 打包" : "✓ 確認收款"}</button>
+            <button className="btn tiny danger" onClick={() => decide(o.id, false)}>{is711cod ? "退回" : "退回（重新付款）"}</button>
           </div>
         </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -1233,6 +1390,23 @@ function OrdersList({ session, flash, initialFilter }) {
   const [filter, setFilter] = useState(initialFilter || "all");
   useEffect(() => { setFilter(initialFilter || "all"); }, [initialFilter]);
   const [list, setList] = useState(null);
+  const [exporting, setExporting] = useState(false);
+
+  const handleExport = async () => {
+    if (!list || !list.length) { flash("目前沒有可導出的訂單"); return; }
+    setExporting(true);
+    try {
+      const ids = list.map((o) => o.id);
+      let rows = list;
+      if (ids.length) {
+        const pkgs = await rest(`packages?shipment_id=in.(${ids.join(",")})&select=shipment_id`, { token });
+        const cnt = pkgs.reduce((m, p) => ((m[p.shipment_id] = (m[p.shipment_id] || 0) + 1), m), {});
+        rows = list.map((o) => ({ ...o, _items: Array(cnt[o.id] || 0).fill(0) }));
+      }
+      await exportLogisticsXlsx(rows, flash);
+    } catch (e) { flash(e.message); }
+    setExporting(false);
+  };
   const FS = [
     { k: "all", label: "全部" },
     { k: "awaiting_payment", label: "待付款" },
@@ -1269,6 +1443,11 @@ function OrdersList({ session, flash, initialFilter }) {
   return (
     <div>
       <div className="subtabs">{FS.map((f) => <button key={f.k} className={"subtab " + (filter === f.k ? "on" : "")} onClick={() => setFilter(f.k)}>{f.label}</button>)}</div>
+      {list && list.length > 0 && (
+        <div className="orders-toolbar">
+          <button className="btn primary tiny" disabled={exporting} onClick={handleExport}>{exporting ? "導出中…" : `📥 導出物流面單（${list.length}）`}</button>
+        </div>
+      )}
       {list && list.length > 0 && (filter.startsWith("today_") || filter === "shipped") && (
         <div className="ord-sum">共 {list.length} 筆 · 重量 {totalWeight.toFixed(3)} kg{totalAmount.RMB ? ` · RMB ¥${totalAmount.RMB.toFixed(2)}` : ""}{totalAmount.TWD ? ` · TWD NT$${totalAmount.TWD.toFixed(2)}` : ""}</div>
       )}
@@ -1277,7 +1456,8 @@ function OrdersList({ session, flash, initialFilter }) {
           {list.map((o) => (
             <div className="card order" key={o.id}>
               <div className="order-h"><span className="mono">{o.order_no}</span><span className="chip chip-grey">{LBL[o.status] || o.status}</span></div>
-              <div className="small">{o._user?.username || "—"} · {o.delivery_type === "home" ? "宅配" : "7-11"} · {o.total_weight}kg · {new Date(o.created_at).toLocaleString("zh-TW")}</div>
+              <div className="small">{o._user?.username || "—"} · {o._user?.phone || "—"} · {o.delivery_type === "home" ? "宅配" : "7-11"} · {o.total_weight}kg · {new Date(o.created_at).toLocaleString("zh-TW")}</div>
+              <RecipientInfo o={o} />
               <div className="order-pay"><span>金額</span><b className="mono">{o.currency === "TWD" ? "NT$" : "¥"}{o.freight_amount}</b></div>
               {o.return_tracking_no && <div className="small mono">{o.return_carrier || (o.delivery_type==="711"?"7-ELEVEN":"新竹物流")} · {o.return_tracking_no}</div>}
             </div>
@@ -1290,50 +1470,203 @@ function OrdersList({ session, flash, initialFilter }) {
 
 /* ===================== 打包出貨 ===================== */
 function PackOps({ session, flash }) {
-  const { token } = session;
-  const [list, setList] = useState(null);
+  const { token, me } = session;
+  const myId   = me?.id;
+  const myName = me?.display_name || me?.email || "未知";
+  const [list, setList]     = useState(null);
   const [openId, setOpenId] = useState(null);
+  const [busy, setBusy]     = useState("");  // shipment id 正在操作
+  const [exporting, setExporting] = useState(false);
+
+  const handleExport = async () => {
+    setExporting(true);
+    try { await exportLogisticsXlsx(list, flash); } catch (e) { flash(e.message); }
+    setExporting(false);
+  };
+
   const load = async () => {
     try {
-      const s = await rest("shipments?status=eq.packing&select=*&order=paid_at.asc.nullslast,created_at.asc", { token });
-      const ids = Array.from(new Set(s.map((x) => x.user_id)));
-      let users = {};
-      if (ids.length) { const us = await rest(`app_users?id=in.(${ids.join(",")})&select=id,username,phone`, { token }); users = Object.fromEntries(us.map((u) => [u.id, u])); }
-      const sids = s.map((x) => x.id);
-      let pkgs = [];
+      const s = await rest(
+        "shipments?status=eq.packing&select=*&order=paid_at.asc.nullslast,created_at.asc",
+        { token }
+      );
+      const ids  = Array.from(new Set(s.map(x => x.user_id)));
+      let users  = {};
+      if (ids.length) {
+        const us = await rest(`app_users?id=in.(${ids.join(",")})&select=id,username,phone`, { token });
+        users = Object.fromEntries(us.map(u => [u.id, u]));
+      }
+      const sids = s.map(x => x.id);
+      let pkgs   = [];
       if (sids.length) pkgs = await rest(`packages?shipment_id=in.(${sids.join(",")})&select=*`, { token });
-      const grp = pkgs.reduce((m, p) => ((m[p.shipment_id] = m[p.shipment_id] || []).push(p), m), {});
-      s.forEach((x) => { x._user = users[x.user_id]; x._items = grp[x.id] || []; });
+      const grp  = pkgs.reduce((m, p) => ((m[p.shipment_id] = m[p.shipment_id] || []).push(p), m), {});
+      s.forEach(x => { x._user = users[x.user_id]; x._items = grp[x.id] || []; });
       setList(s);
     } catch (e) { flash(e.message); }
   };
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(); const t = setInterval(load, 15000); return () => clearInterval(t); }, []);
+
+  // 認領：呼叫 RPC claim_packing（atomic）
+  const claim = async (shipmentId) => {
+    setBusy(shipmentId);
+    try {
+      const r = await fetch(`${SUPA_URL}/rest/v1/rpc/claim_packing`, {
+        method: "POST",
+        headers: { apikey: ANON, Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ p_shipment_id: shipmentId, p_admin_id: myId, p_admin_name: myName }),
+      });
+      const d = await r.json();
+      if (!r.ok || !d.ok) { flash(d.error || "認領失敗，請重試"); await load(); }
+      else { setOpenId(shipmentId); await load(); }
+    } catch (e) { flash(e.message); }
+    setBusy("");
+  };
+
+  // 放棄：呼叫 RPC release_packing
+  const release = async (shipmentId) => {
+    setBusy(shipmentId);
+    try {
+      await fetch(`${SUPA_URL}/rest/v1/rpc/release_packing`, {
+        method: "POST",
+        headers: { apikey: ANON, Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ p_shipment_id: shipmentId, p_admin_id: myId }),
+      });
+      setOpenId(null); await load();
+    } catch (e) { flash(e.message); }
+    setBusy("");
+  };
+
+  // 判斷鎖定狀態
+  const getLockState = (o) => {
+    if (!o.packing_by) return "free";
+    const lockedAt = o.packing_locked_at ? new Date(o.packing_locked_at) : null;
+    const expired  = lockedAt && (Date.now() - lockedAt.getTime() > 3600000);
+    if (expired) return "free";
+    if (o.packing_by === myId) return "mine";
+    return "other";
+  };
+
+  const minutesAgo = (ts) => {
+    if (!ts) return 0;
+    return Math.floor((Date.now() - new Date(ts).getTime()) / 60000);
+  };
+
+  const freeCount  = list?.filter(o => getLockState(o) === "free").length ?? 0;
+  const mineCount  = list?.filter(o => getLockState(o) === "mine").length ?? 0;
+  const otherCount = list?.filter(o => getLockState(o) === "other").length ?? 0;
+
   if (!list) return <div><h2 className="page-t">打包出貨</h2><div className="muted">載入中…</div></div>;
+
   return (
     <div>
-      <h2 className="page-t">打包出貨</h2>
+      <div className="page-h-row">
+        <h2 className="page-t">打包出貨</h2>
+        <div className="page-h-actions">
+          <button className="btn primary" disabled={exporting || !list.length} onClick={handleExport}>
+            {exporting ? "導出中…" : `📥 導出物流面單（${list.length}）`}
+          </button>
+          <button className="btn ghost" onClick={load}>↻ 刷新</button>
+        </div>
+      </div>
+
+      {/* 狀態摘要列 */}
+      {list.length > 0 && (
+        <div className="pack-summary">
+          <div className="pack-sum-item free">
+            <b>{freeCount}</b><span>待認領</span>
+          </div>
+          <div className="pack-sum-item mine">
+            <b>{mineCount}</b><span>我認領的</span>
+          </div>
+          <div className="pack-sum-item other">
+            <b>{otherCount}</b><span>他人認領中</span>
+          </div>
+          <div className="pack-sum-hint">每 15 秒自動刷新 · 超過 1 小時未出貨自動解鎖</div>
+        </div>
+      )}
+
       {list.length === 0 ? <div className="empty big">目前沒有待打包的訂單 🎉</div> : (
         <div className="admin-list">
-          {list.map((o) => (
-            <div className="card pack" key={o.id}>
-              <div className="order-h"><span className="mono">{o.order_no}</span><span className="chip chip-sea">打包中</span></div>
-              <div className="small">{o._user?.username} · {o._user?.phone} · {o.delivery_type === "home" ? "宅配到府" : "7-11 取貨"} · 總重 {o.total_weight}kg</div>
-              <div className="recipient-snap">
-                <b>收件資訊</b>
-                {o.delivery_type === "home"
-                  ? <div className="small">{o.recipient_snapshot?.receiver_name} · {o.recipient_snapshot?.phone}<br/>{o.recipient_snapshot?.detail}</div>
-                  : <div className="small">7-11 {o.recipient_snapshot?.store_name}門市<br/>取貨人 {o.recipient_snapshot?.receiver_name} · {o.recipient_snapshot?.phone}<br/>{o.recipient_snapshot?.store_addr}</div>}
+          {list.map(o => {
+            const lockState = getLockState(o);
+            const mins      = minutesAgo(o.packing_locked_at);
+            const isOpen    = openId === o.id && lockState === "mine";
+            const isBusy    = busy === o.id;
+
+            return (
+              <div className={"card pack pack-" + lockState} key={o.id}>
+                {/* 訂單標頭 */}
+                <div className="pack-head">
+                  <div>
+                    <span className="mono pack-order-no">{o.order_no}</span>
+                    {lockState === "mine" && (
+                      <span className="pack-badge mine-badge">🟢 我認領中</span>
+                    )}
+                    {lockState === "other" && (
+                      <span className="pack-badge other-badge">🔴 {o.packing_by_name}（{mins} 分鐘前）</span>
+                    )}
+                    {lockState === "free" && (
+                      <span className="pack-badge free-badge">⬜ 待認領</span>
+                    )}
+                  </div>
+                  <span className="chip chip-sea">打包中</span>
+                </div>
+
+                {/* 客戶與收件資訊 */}
+                <div className="small" style={{marginBottom:6}}>
+                  {o._user?.username} · {o._user?.phone} · {o.delivery_type === "home" ? "宅配到府" : "7-11 取貨"} · 總重 {o.total_weight}kg
+                </div>
+                <div className="recipient-snap">
+                  <b>收件資訊</b>
+                  {o.delivery_type === "home"
+                    ? <div className="small">{o.recipient_snapshot?.receiver_name} · {o.recipient_snapshot?.phone}<br/>{o.recipient_snapshot?.detail}</div>
+                    : <div className="small">7-11 {o.recipient_snapshot?.store_name}門市<br/>取貨人 {o.recipient_snapshot?.receiver_name} · {o.recipient_snapshot?.phone}<br/>{o.recipient_snapshot?.store_addr}</div>}
+                </div>
+
+                {/* 包裹明細 */}
+                <div className="pack-items">
+                  <b>本單包裹（{o._items.length} 件）</b>
+                  {o._items.map(p => (
+                    <div key={p.id} className="batch-row">
+                      <span className="mono small">{p.tracking_no}</span>
+                      <span className="small">{p.product_name}</span>
+                      <span className="mono small">{p.weight}kg</span>
+                      {p.shelf_code && <span className="shelf">{p.shelf_code}</span>}
+                    </div>
+                  ))}
+                </div>
+                <div className="order-pay"><span>已收金額</span><b className="mono">{o.currency === "TWD" ? "NT$" : "¥"}{o.freight_amount}</b></div>
+
+                {/* 操作區 */}
+                {lockState === "free" && (
+                  <div className="ac-actions">
+                    <button className="btn primary" disabled={isBusy} onClick={() => claim(o.id)}>
+                      {isBusy ? "認領中…" : "✋ 認領此訂單開始打包"}
+                    </button>
+                  </div>
+                )}
+                {lockState === "mine" && !isOpen && (
+                  <div className="ac-actions">
+                    <button className="btn primary" onClick={() => setOpenId(o.id)}>📦 填寫出貨資訊</button>
+                    <button className="btn ghost" disabled={isBusy} onClick={() => release(o.id)}>放棄認領</button>
+                  </div>
+                )}
+                {lockState === "mine" && isOpen && (
+                  <ShipForm
+                    shipment={o}
+                    token={token}
+                    onCancel={() => { setOpenId(null); release(o.id); }}
+                    onDone={() => { setOpenId(null); load(); flash("✅ 已標記出貨"); }}
+                  />
+                )}
+                {lockState === "other" && (
+                  <div className="pack-locked-msg">
+                    🔒 {o.packing_by_name} 認領中，請選擇其他訂單。超過 1 小時未出貨將自動解鎖。
+                  </div>
+                )}
               </div>
-              <div className="pack-items">
-                <b>本單包裹（{o._items.length} 件）</b>
-                {o._items.map((p) => <div key={p.id} className="batch-row"><span className="mono small">{p.tracking_no}</span><span className="small">{p.product_name}</span><span className="mono small">{p.weight}kg</span>{p.shelf_code && <span className="shelf">{p.shelf_code}</span>}</div>)}
-              </div>
-              <div className="order-pay"><span>已收金額</span><b className="mono">{o.currency === "TWD" ? "NT$" : "¥"}{o.freight_amount}</b></div>
-              {openId === o.id
-                ? <ShipForm shipment={o} token={token} onCancel={() => setOpenId(null)} onDone={() => { setOpenId(null); load(); flash("已標記出貨"); }} />
-                : <div className="ac-actions"><button className="btn primary" onClick={() => setOpenId(o.id)}>標記出貨</button></div>}
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </div>
@@ -3168,6 +3501,13 @@ const CSS = `
 .chip{font-size:11px;font-weight:600;padding:3px 9px;border-radius:20px}
 .chip-grey{background:#ECEFEF;color:#6b7a7e}.chip-sea{background:#E0F0F2;color:#0F7C8A}.chip-alert{background:#FBE3E2;color:#D9534F}.chip-leaf{background:#E2F3EC;color:#2FA37A}
 .shelf{font-size:11px;background:#EAF4F5;color:#0F7C8A;padding:2px 8px;border-radius:6px;font-weight:600}
+.batch-head{font-size:13px;color:#3a4a4e;margin:10px 0 6px}
+.batch-head b{font-family:'Space Grotesk';font-size:15px;color:#0F7C8A}
+.batch-row .cur-tag{font-size:10px;font-weight:700;background:#F4A23C;color:#fff;padding:2px 7px;border-radius:6px;white-space:nowrap}
+.batch-row.done{opacity:.5}
+.batch-w{font-size:11px;color:#6b7a7e;font-weight:600}
+.batch-hist{margin-top:8px}
+.hist-toggle{background:none;border:none;color:#6b7a7e;font-size:13px;font-weight:600;cursor:pointer;padding:4px 0;font-family:inherit}
 
 .weigh .weigh-h{font-family:'Space Grotesk';font-weight:600;font-size:15px;margin-bottom:12px}
 .upload{display:flex;align-items:center;justify-content:center;border:2px dashed #cdd5d5;border-radius:12px;height:130px;color:#8a9699;font-size:14px;overflow:hidden;cursor:pointer;margin-bottom:10px}
@@ -3261,6 +3601,7 @@ const CSS = `
 
 /* 訂單列表摘要 */
 .ord-sum{background:#FFF8EF;border:1px dashed #F4A23C;color:#8a5a12;border-radius:10px;padding:10px 14px;font-size:13px;margin:8px 0 12px;font-weight:600}
+.orders-toolbar{display:flex;justify-content:flex-end;margin:8px 0 4px}
 .ord-sum b{color:#c9760a;font-size:15px}
 
 /* 邀請好友列 / 積分流水 */
@@ -3306,7 +3647,51 @@ const CSS = `
 .member-stats{margin:0}
 .page-head .btn{flex-shrink:0}
 
-/* ── 登入頁雙模式 ── */
+/* ── 打包出貨：認領制 ── */
+.pack-summary{display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+  background:#F5F6F4;border-radius:12px;padding:12px 16px;margin-bottom:16px}
+.pack-sum-item{display:flex;align-items:center;gap:6px;padding:6px 12px;border-radius:8px}
+.pack-sum-item b{font-family:'Space Grotesk';font-size:20px;font-weight:700}
+.pack-sum-item span{font-size:12.5px;color:#5a6a6e}
+.pack-sum-item.free{background:#ECFDF5} .pack-sum-item.free b{color:#065F46}
+.pack-sum-item.mine{background:#EFF6FF} .pack-sum-item.mine b{color:#1B3A6B}
+.pack-sum-item.other{background:#FEF2F2} .pack-sum-item.other b{color:#B91C1C}
+.pack-sum-hint{font-size:11.5px;color:#9aa6a9;margin-left:auto}
+
+/* 打包單卡片依狀態顯示不同樣式 */
+.pack-free {border-left:4px solid #10B981}
+.pack-mine {border-left:4px solid #1B3A6B;background:#F5F8FF}
+.pack-other{border-left:4px solid #E5E7EB;opacity:.7}
+
+.pack-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.pack-order-no{font-size:16px;font-weight:700;color:#0E2A33}
+.pack-badge{font-size:12px;font-weight:600;border-radius:6px;padding:3px 9px;margin-left:8px}
+.mine-badge {background:#EFF6FF;color:#1B3A6B}
+.other-badge{background:#FEF2F2;color:#B91C1C}
+.free-badge {background:#ECFDF5;color:#065F46}
+
+.pack-locked-msg{background:#F9FAFB;border:1px dashed #D1D5DB;border-radius:9px;
+  padding:10px 14px;font-size:13px;color:#6B7280;margin-top:10px}
+
+/* 總覽打包進度區塊 */
+.pack-progress-block{background:#fff;border:1.5px solid #E0E3E0;border-radius:14px;
+  padding:16px;margin-top:14px}
+.pack-progress-title{display:flex;justify-content:space-between;align-items:center;
+  margin-bottom:12px;font-family:'Space Grotesk';font-size:15px;font-weight:700;color:#0E2A33}
+.pack-progress-meta{display:flex;gap:12px;font-size:12.5px;font-weight:600}
+.pp-free{color:#065F46}.pp-locked{color:#1B3A6B}
+.pp-list{display:flex;flex-direction:column;gap:8px}
+.pp-row{display:flex;align-items:center;gap:12px;padding:10px 12px;
+  background:#F5F8FF;border-radius:10px;border:1px solid #DADEEA}
+.pp-avatar{width:36px;height:36px;border-radius:50%;background:#1B3A6B;
+  color:#fff;display:flex;align-items:center;justify-content:center;
+  font-size:15px;font-weight:700;flex-shrink:0}
+.pp-info{flex:1}
+.pp-name{font-size:14px;font-weight:700;color:#0E2A33}
+.pp-time{font-size:12px;color:#9aa6a9;margin-top:2px}
+.pp-count{font-family:'Space Grotesk';font-size:22px;font-weight:700;color:#1B3A6B}
+.pp-empty{color:#9aa6a9;font-size:13px;padding:8px 0}
+
 .login-tabs{display:flex;background:#F5F6F4;border-radius:11px;padding:4px;margin-bottom:18px;gap:4px}
 .login-tabs button{flex:1;border:0;background:transparent;padding:9px 14px;border-radius:8px;
   font-size:14px;font-weight:600;color:#5a6a6e;cursor:pointer;font-family:inherit;transition:all .15s}
@@ -3323,6 +3708,7 @@ const CSS = `
 
 /* ── 業務員管理列表 ── */
 .page-h-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:10px}
+.page-h-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .sp-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px}
 .sp-card{background:#fff;border:1.5px solid #E0E3E0;border-radius:14px;padding:16px;
   transition:box-shadow .15s}
